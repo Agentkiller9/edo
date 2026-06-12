@@ -24,8 +24,9 @@ try:  # rich is optional; fall back to plain stdout if unavailable.
 except ImportError:  # pragma: no cover
     _RICH = False
 
-from src import docker_mgr, network, wireguard
+from src import docker_mgr, network, preflight, wireguard
 from src.db_mgr import DatabaseManager
+from src.preflight import PreflightReport, Severity
 
 logger = logging.getLogger(__name__)
 
@@ -72,10 +73,48 @@ def require_root() -> None:
     geteuid = getattr(os, "geteuid", None)
     if geteuid is None or geteuid() != 0:
         _print(
-            "[!] edo requires root (sudo). iptables and WireGuard need it.",
+            "[!] edo requires root (sudo). iptables and WireGuard need it.\n"
+            "    Tip: if you installed in a venv, sudo your venv's interpreter:\n"
+            "         sudo ./myvenv/bin/python edo.py",
             style="bold red",
         )
         sys.exit(1)
+
+
+_SEVERITY_STYLE = {
+    Severity.CRITICAL: ("bold red", "✗"),
+    Severity.WARNING: ("yellow", "!"),
+    Severity.INFO: ("dim", "·"),
+}
+
+
+def render_preflight(report: PreflightReport, title: str = "Preflight") -> None:
+    if _console:
+        table = Table(title=title, header_style="bold magenta", show_lines=False)
+        for col in ("", "Check", "Detail", "Hint"):
+            table.add_column(col)
+        for c in report.checks:
+            style, sym = _SEVERITY_STYLE[c.severity]
+            mark = "[green]✓[/]" if c.ok else f"[{style}]{sym}[/]"
+            table.add_row(mark, c.name, c.detail or "—", c.hint or "")
+        _console.print(table)
+    else:
+        for c in report.checks:
+            mark = "OK " if c.ok else "FAIL"
+            print(f"  [{mark}] {c.name:30}  {c.detail}")
+            if c.hint and not c.ok:
+                print(f"           hint: {c.hint}")
+
+
+def gate_with_preflight(command: str) -> bool:
+    """Run targeted checks before a mutating command. Returns False to abort."""
+    report = preflight.quick_checks_for(command)
+    failures = report.critical_failures
+    if failures:
+        _print(f"[!] Preflight failed for `{command}`. Fix these first:", style="bold red")
+        render_preflight(report, title=f"Preflight for {command}")
+        return False
+    return True
 
 
 def show_banner() -> None:
@@ -86,7 +125,34 @@ def show_banner() -> None:
 
 
 # ---- commands -----------------------------------------------------------
+def cmd_doctor(args: argparse.Namespace, db: DatabaseManager) -> int:
+    """Diagnose the host: required binaries, kernel module, daemons, network."""
+    include_runtime = not getattr(args, "no_runtime", False)
+    report = preflight.run_all_checks(include_runtime=include_runtime)
+    render_preflight(report, title="edo doctor")
+
+    crit = len(report.critical_failures)
+    warn = len(report.warnings)
+    if crit:
+        _print(
+            f"\n[!] {crit} critical issue(s), {warn} warning(s). "
+            "edo cannot run until criticals are resolved.",
+            style="bold red",
+        )
+        return 1
+    if warn:
+        _print(
+            f"\n[*] {warn} warning(s). edo will run but check the hints above.",
+            style="yellow",
+        )
+        return 0
+    _print("\n[+] All checks passed. Host is ready.", style="bold green")
+    return 0
+
+
 def cmd_init(args: argparse.Namespace, db: DatabaseManager) -> int:
+    if not gate_with_preflight("init"):
+        return 1
     endpoint = getattr(args, "endpoint", None) or _ask(
         "Public endpoint clients will dial"
     )
@@ -117,6 +183,8 @@ def cmd_init(args: argparse.Namespace, db: DatabaseManager) -> int:
 
 
 def cmd_add_peer(args: argparse.Namespace, db: DatabaseManager) -> int:
+    if not gate_with_preflight("add-peer"):
+        return 1
     username = getattr(args, "username", None) or _ask("Username")
     if not username:
         _print("[!] username required", style="bold red")
@@ -161,6 +229,8 @@ def cmd_remove_peer(args: argparse.Namespace, db: DatabaseManager) -> int:
 
 
 def cmd_summon(args: argparse.Namespace, db: DatabaseManager) -> int:
+    if not gate_with_preflight("summon"):
+        return 1
     raw = getattr(args, "path", None) or _ask(
         "Absolute path to challenge directory"
     )
@@ -311,6 +381,7 @@ def interactive_menu(db: DatabaseManager, args: argparse.Namespace) -> int:
         "4": ("Release a vessel (teardown container)", cmd_release),
         "5": ("Initialise / re-apply infrastructure", cmd_init),
         "6": ("Lift the seal (teardown everything)", cmd_teardown),
+        "7": ("Diagnose host (edo doctor)", cmd_doctor),
         "q": ("Quit", None),
     }
 
@@ -332,8 +403,8 @@ def interactive_menu(db: DatabaseManager, args: argparse.Namespace) -> int:
         except KeyboardInterrupt:
             _print("\n[!] Cancelled", style="yellow")
         except Exception as e:
-            logger.exception("command failed")
-            _print(f"[!] Error: {e}", style="bold red")
+            logger.debug("command failed", exc_info=True)
+            _print(f"[!] {_format_exception(e)}", style="bold red")
 
 
 # ---- argument parser ----------------------------------------------------
@@ -380,10 +451,80 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("menu", help="Open interactive menu (default)")
 
+    p_doc = sub.add_parser(
+        "doctor",
+        help="Diagnose the host — binaries, kernel module, daemons, network",
+    )
+    p_doc.add_argument(
+        "--no-runtime",
+        action="store_true",
+        help="Skip checks that touch running services (docker daemon, port bind)",
+    )
+
     return p
 
 
+# ---- error translation --------------------------------------------------
+def _format_exception(e: BaseException) -> str:
+    """Map common exception shapes to actionable, single-paragraph messages."""
+    import subprocess as _sp
+
+    # Missing binary — most likely a known dependency.
+    if isinstance(e, FileNotFoundError):
+        missing = getattr(e, "filename", None) or "?"
+        try:
+            hint = preflight.install_hint(str(missing))
+        except Exception:
+            hint = "install the missing tool"
+        return f"required binary not found: {missing}\n  install: {hint}"
+
+    # Subprocess returned non-zero. Pull out the stderr so the user sees the
+    # actual failure instead of the generic CalledProcessError repr.
+    if isinstance(e, _sp.CalledProcessError):
+        stderr = (e.stderr or "").strip()
+        cmd = e.cmd[0] if isinstance(e.cmd, list) and e.cmd else str(e.cmd)
+        stderr_low = stderr.lower()
+        if "operation not permitted" in stderr_low or "permission denied" in stderr_low:
+            return (
+                f"`{cmd}` failed with a permission error.\n"
+                f"  stderr: {stderr}\n"
+                f"  hint:   run with sudo (point at your venv's python if you used one)"
+            )
+        if "rtnetlink answers: file exists" in stderr_low:
+            return (
+                f"`{cmd}` reported an interface/route already exists.\n"
+                f"  stderr: {stderr}\n"
+                f"  hint:   if this is leftover from a prior run, `edo teardown` first"
+            )
+        return f"`{cmd}` exited {e.returncode}: {stderr}"
+
+    # Catch-all for the docker SDK if it's loaded.
+    try:
+        from docker.errors import DockerException
+
+        if isinstance(e, DockerException):
+            low = str(e).lower()
+            if "permission denied" in low:
+                hint = "run with sudo, or add user to docker group"
+            elif "connection refused" in low or "no such file" in low:
+                hint = "start the daemon: sudo systemctl start docker"
+            else:
+                hint = "run `edo doctor` for a full diagnosis"
+            return f"docker error: {e}\n  hint: {hint}"
+    except ImportError:
+        pass
+
+    return f"{type(e).__name__}: {e}"
+
+
 # ---- entrypoint ---------------------------------------------------------
+# Commands that don't need root or a DB connection. Doctor is the obvious
+# one — its whole job is to *report* missing capabilities, so it can't itself
+# require them.
+_NO_ROOT_COMMANDS = {"doctor"}
+_NO_DB_COMMANDS = {"doctor"}
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -393,10 +534,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    require_root()
+    if args.command not in _NO_ROOT_COMMANDS:
+        require_root()
 
-    db_path = args.db or Path("/var/lib/edo/edo.db")
-    db = DatabaseManager(db_path=db_path)
+    if args.command in _NO_DB_COMMANDS:
+        db: Optional[DatabaseManager] = None
+    else:
+        db_path = args.db or Path("/var/lib/edo/edo.db")
+        db = DatabaseManager(db_path=db_path)
 
     dispatch: Dict[str, MenuHandler] = {
         "init": cmd_init,
@@ -406,6 +551,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "release": cmd_release,
         "status": cmd_status,
         "teardown": cmd_teardown,
+        "doctor": cmd_doctor,
     }
 
     if args.command in dispatch:
@@ -415,8 +561,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             _print("\n[!] Cancelled", style="yellow")
             return 130
         except Exception as e:
-            logger.exception("command failed")
-            _print(f"[!] Error: {e}", style="bold red")
+            logger.debug("command failed", exc_info=True)
+            _print(f"[!] {_format_exception(e)}", style="bold red")
+            _print(
+                "    run `edo doctor` to diagnose the host, or re-run with --verbose for a stack trace.",
+                style="dim",
+            )
             return 1
 
     if args.command in (None, "menu"):

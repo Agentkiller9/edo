@@ -59,7 +59,17 @@ class FirewallApplyResult:
 # ---- subprocess helpers -------------------------------------------------
 def _run(cmd: List[str], check: bool = True) -> subprocess.CompletedProcess:
     logger.debug("exec: %s", " ".join(cmd))
-    return subprocess.run(cmd, capture_output=True, text=True, check=check)
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, check=check)
+    except FileNotFoundError as e:
+        # Translate missing-binary failures into actionable hints. Imported
+        # lazily to avoid a circular import on module load.
+        from src.preflight import install_hint
+
+        raise RuntimeError(
+            f"required binary not found: {cmd[0]}\n"
+            f"  install: {install_hint(cmd[0])}"
+        ) from e
 
 
 def get_public_interface() -> Optional[str]:

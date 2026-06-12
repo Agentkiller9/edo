@@ -58,6 +58,13 @@ Run via `sudo`:
 sudo /opt/edo/.venv/bin/python /opt/edo/edo.py <command>
 ```
 
+> ⚠ **Do not run `sudo python3 edo.py` from an activated venv.** `sudo`
+> resets `PATH` and ignores venv activation — it resolves `python3` to the
+> system interpreter, which does not see packages you `pip install`ed into
+> the venv. You'll get `ModuleNotFoundError: No module named 'docker'` even
+> though `pip install` succeeded. Always point `sudo` at the venv's
+> interpreter explicitly: `sudo ./myvenv/bin/python edo.py`.
+
 Optionally drop a wrapper into `/usr/local/bin/edo`:
 
 ```bash
@@ -126,6 +133,7 @@ Run `sudo edo` with no arguments for the menu:
 | `edo status` | Print the bound peers and running containers as tables. |
 | `edo teardown [--yes]` | Release every container, remove the bridge, lift the firewall, bring `wg0` down. |
 | `edo menu` | Open the interactive menu (this is also the default with no command). |
+| `edo doctor [--no-runtime]` | Diagnose the host: required binaries, kernel module, default route, docker daemon, port availability. Runs as non-root so you can spot the missing pieces *before* `sudo`. |
 
 Global flags:
 
@@ -206,7 +214,39 @@ to participants in `edo status`.
 
 ## Troubleshooting
 
-- **"edo requires root"** — run with `sudo`.
+**Always start with `edo doctor`.** It runs without root, checks every
+prerequisite, and tells you the exact `apt` / `dnf` / `pacman` command
+needed to fix anything missing. Critical issues block `init` / `add-peer` /
+`summon` automatically — those commands run the same checks before they
+touch anything.
+
+```bash
+./myvenv/bin/python edo.py doctor              # full diagnosis (no root)
+sudo ./myvenv/bin/python edo.py doctor         # full diagnosis (root)
+./myvenv/bin/python edo.py doctor --no-runtime # skip docker daemon/port checks
+```
+
+What it checks:
+
+| | |
+| --- | --- |
+| root privileges | `os.geteuid() == 0` |
+| binaries | `wg`, `wg-quick`, `iptables`, `ip`, `sysctl`, `docker` |
+| python SDK | `import docker` |
+| kernel | `wireguard` module loaded or loadable |
+| sysctl | `net.ipv4.ip_forward` |
+| routing | default IPv4 route present |
+| docker | daemon reachable via `ping()` |
+| docker | `10.9.0.0/24` not already owned by another bridge |
+| wg0 | interface state |
+| port | `51820/udp` available |
+
+Specific failure modes worth knowing:
+
+- **`ModuleNotFoundError: No module named 'docker'` under sudo** — `sudo`
+  resets PATH and ignores venv activation, so `sudo python3` runs the
+  system interpreter, not your venv's. Run sudo against the venv's
+  interpreter directly: `sudo ./myvenv/bin/python edo.py`.
 - **`apply_firewall` complains about the public interface** — `edo` resolves
   the egress interface from `ip -4 route show default`. If your host has no
   default IPv4 route, set one before running `init`.

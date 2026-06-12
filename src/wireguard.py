@@ -56,9 +56,17 @@ def _run(
     cmd: List[str], stdin: Optional[str] = None, check: bool = True
 ) -> subprocess.CompletedProcess:
     logger.debug("exec: %s", " ".join(cmd))
-    return subprocess.run(
-        cmd, input=stdin, capture_output=True, text=True, check=check
-    )
+    try:
+        return subprocess.run(
+            cmd, input=stdin, capture_output=True, text=True, check=check
+        )
+    except FileNotFoundError as e:
+        from src.preflight import install_hint
+
+        raise RuntimeError(
+            f"required binary not found: {cmd[0]}\n"
+            f"  install: {install_hint(cmd[0])}"
+        ) from e
 
 
 # ---- key generation -----------------------------------------------------

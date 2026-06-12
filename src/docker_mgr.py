@@ -21,13 +21,42 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
+# Deferred import: the docker SDK isn't required to *load* this module —
+# only to *use* it. That lets `edo doctor` run and tell the user the SDK is
+# missing instead of crashing at import time before the CLI starts.
 try:
     import docker
-    from docker.errors import APIError, BuildError, ImageNotFound, NotFound
-except ImportError as e:  # pragma: no cover - dependency failure path
-    raise ImportError(
-        "The 'docker' Python package is required. Install with: pip install docker"
-    ) from e
+    from docker.errors import (
+        APIError,
+        BuildError,
+        DockerException,
+        ImageNotFound,
+        NotFound,
+    )
+
+    _DOCKER_SDK_AVAILABLE = True
+except ImportError:
+    docker = None  # type: ignore[assignment]
+    _DOCKER_SDK_AVAILABLE = False
+
+    # Stand-in classes keep ``except`` blocks elsewhere in this module valid
+    # without the real SDK. They never match a real docker error because
+    # ``_require_docker()`` raises first if the SDK is absent.
+    class APIError(Exception):  # type: ignore[no-redef]
+        pass
+
+    class BuildError(Exception):  # type: ignore[no-redef]
+        pass
+
+    class DockerException(Exception):  # type: ignore[no-redef]
+        pass
+
+    class ImageNotFound(Exception):  # type: ignore[no-redef]
+        pass
+
+    class NotFound(Exception):  # type: ignore[no-redef]
+        pass
+
 
 from src.db_mgr import Container, DatabaseManager
 from src.network import (
@@ -60,17 +89,68 @@ def _run(
     cmd: List[str], cwd: Optional[Path] = None, check: bool = True
 ) -> subprocess.CompletedProcess:
     logger.debug("exec: %s (cwd=%s)", " ".join(cmd), cwd)
-    return subprocess.run(
-        cmd,
-        cwd=str(cwd) if cwd else None,
-        capture_output=True,
-        text=True,
-        check=check,
-    )
+    try:
+        return subprocess.run(
+            cmd,
+            cwd=str(cwd) if cwd else None,
+            capture_output=True,
+            text=True,
+            check=check,
+        )
+    except FileNotFoundError as e:
+        from src.preflight import install_hint
+
+        raise RuntimeError(
+            f"required binary not found: {cmd[0]}\n"
+            f"  install: {install_hint(cmd[0])}"
+        ) from e
+
+
+def _require_docker() -> None:
+    """Fail with a clean message if the docker SDK never loaded."""
+    if not _DOCKER_SDK_AVAILABLE:
+        raise RuntimeError(
+            "docker python SDK not installed (pip install docker).\n"
+            "  Common gotcha: `sudo python3` ignores activated venvs — use the\n"
+            "  venv's interpreter directly: `sudo ./myvenv/bin/python edo.py`."
+        )
+
+
+_client_cache: Optional["docker.DockerClient"] = None
 
 
 def _client() -> "docker.DockerClient":
-    return docker.from_env()
+    """Cached docker client. First call validates the daemon is reachable."""
+    global _client_cache
+    if _client_cache is not None:
+        return _client_cache
+    _require_docker()
+    try:
+        client = docker.from_env()
+        client.ping()
+    except DockerException as e:
+        msg = str(e)
+        low = msg.lower()
+        if "permission denied" in low:
+            hint = (
+                "permission denied on the docker socket. Run with sudo, or add "
+                "your user to the docker group: sudo usermod -aG docker $USER (then log back in)."
+            )
+        elif (
+            "connection refused" in low
+            or "no such file" in low
+            or "cannot connect" in low
+            or "failureerror" in low
+        ):
+            hint = (
+                "docker daemon not reachable. Start it: sudo systemctl start docker "
+                "(and `sudo systemctl enable docker` to bring it up at boot)."
+            )
+        else:
+            hint = "is docker installed and running?"
+        raise RuntimeError(f"docker unavailable: {msg}\n  hint: {hint}") from e
+    _client_cache = client
+    return client
 
 
 def _normalize_project_name(name: str) -> str:
