@@ -1,0 +1,232 @@
+"""SQLite state manager for edo.
+
+Tracks the two pieces of state edo cares about across restarts:
+  * peers      — WireGuard clients (the "bound vessels")
+  * containers — running challenges (the "reanimated")
+
+All access is funnelled through a single re-entrant lock so concurrent CLI
+invocations cannot trample each other's transactions, and every write runs
+inside an explicit BEGIN/COMMIT block with ROLLBACK on exception.
+"""
+from __future__ import annotations
+
+import logging
+import sqlite3
+import threading
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterator, List, Optional
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_DB_PATH = Path("/var/lib/edo/edo.db")
+
+
+@dataclass
+class Peer:
+    id: int
+    username: str
+    ip_address: str
+    public_key: str
+    private_key: str
+
+
+@dataclass
+class Container:
+    id: int
+    container_id: str
+    challenge_name: str
+    source_path: str
+    assigned_ip: str
+    status: str
+
+
+class DatabaseManager:
+    """Thread-safe SQLite wrapper. One instance per process is fine."""
+
+    def __init__(self, db_path: Path = DEFAULT_DB_PATH) -> None:
+        self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
+        self._init_schema()
+
+    @contextmanager
+    def _conn(self) -> Iterator[sqlite3.Connection]:
+        # isolation_level=None puts us in manual-transaction mode; we drive
+        # BEGIN/COMMIT/ROLLBACK ourselves so the contextmanager can guarantee
+        # rollback on any exception thrown by the caller's block.
+        with self._lock:
+            conn = sqlite3.connect(str(self.db_path), isolation_level=None)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("BEGIN")
+            try:
+                yield conn
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+            finally:
+                conn.close()
+
+    def _init_schema(self) -> None:
+        with self._conn() as c:
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS peers (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username    TEXT UNIQUE NOT NULL,
+                    ip_address  TEXT UNIQUE NOT NULL,
+                    public_key  TEXT NOT NULL,
+                    private_key TEXT NOT NULL,
+                    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS containers (
+                    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                    container_id   TEXT UNIQUE NOT NULL,
+                    challenge_name TEXT NOT NULL,
+                    source_path    TEXT NOT NULL,
+                    assigned_ip    TEXT NOT NULL,
+                    status         TEXT NOT NULL DEFAULT 'running',
+                    deployed_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+
+    # ---- peers -----------------------------------------------------------
+    def add_peer(
+        self,
+        username: str,
+        ip_address: str,
+        public_key: str,
+        private_key: str,
+    ) -> Peer:
+        try:
+            with self._conn() as c:
+                cur = c.execute(
+                    "INSERT INTO peers (username, ip_address, public_key, private_key)"
+                    " VALUES (?, ?, ?, ?)",
+                    (username, ip_address, public_key, private_key),
+                )
+                peer_id = int(cur.lastrowid)
+        except sqlite3.IntegrityError as e:
+            raise ValueError(f"peer record collision: {e}") from e
+        return Peer(
+            id=peer_id,
+            username=username,
+            ip_address=ip_address,
+            public_key=public_key,
+            private_key=private_key,
+        )
+
+    def remove_peer(self, username: str) -> bool:
+        with self._conn() as c:
+            cur = c.execute("DELETE FROM peers WHERE username = ?", (username,))
+            return cur.rowcount > 0
+
+    def get_peer(self, username: str) -> Optional[Peer]:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM peers WHERE username = ?", (username,)
+            ).fetchone()
+        return _row_to_peer(row) if row else None
+
+    def get_all_peers(self) -> List[Peer]:
+        with self._conn() as c:
+            rows = c.execute("SELECT * FROM peers ORDER BY id").fetchall()
+        return [_row_to_peer(r) for r in rows]
+
+    def get_used_peer_ips(self) -> List[str]:
+        with self._conn() as c:
+            rows = c.execute("SELECT ip_address FROM peers").fetchall()
+        return [r["ip_address"] for r in rows]
+
+    # ---- containers ------------------------------------------------------
+    def add_container(
+        self,
+        container_id: str,
+        challenge_name: str,
+        source_path: str,
+        assigned_ip: str,
+        status: str = "running",
+    ) -> Container:
+        try:
+            with self._conn() as c:
+                cur = c.execute(
+                    "INSERT INTO containers"
+                    " (container_id, challenge_name, source_path, assigned_ip, status)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (container_id, challenge_name, source_path, assigned_ip, status),
+                )
+                row_id = int(cur.lastrowid)
+        except sqlite3.IntegrityError as e:
+            raise ValueError(f"container record collision: {e}") from e
+        return Container(
+            id=row_id,
+            container_id=container_id,
+            challenge_name=challenge_name,
+            source_path=source_path,
+            assigned_ip=assigned_ip,
+            status=status,
+        )
+
+    def remove_container(self, container_id: str) -> bool:
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM containers WHERE container_id = ?", (container_id,)
+            )
+            return cur.rowcount > 0
+
+    def get_active_containers(self) -> List[Container]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM containers WHERE status = 'running' ORDER BY id"
+            ).fetchall()
+        return [_row_to_container(r) for r in rows]
+
+    def get_all_containers(self) -> List[Container]:
+        with self._conn() as c:
+            rows = c.execute("SELECT * FROM containers ORDER BY id").fetchall()
+        return [_row_to_container(r) for r in rows]
+
+    def get_used_container_ips(self) -> List[str]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT assigned_ip FROM containers WHERE status = 'running'"
+            ).fetchall()
+        return [r["assigned_ip"] for r in rows]
+
+    def update_container_status(self, container_id: str, status: str) -> bool:
+        with self._conn() as c:
+            cur = c.execute(
+                "UPDATE containers SET status = ? WHERE container_id = ?",
+                (status, container_id),
+            )
+            return cur.rowcount > 0
+
+
+def _row_to_peer(row: sqlite3.Row) -> Peer:
+    return Peer(
+        id=row["id"],
+        username=row["username"],
+        ip_address=row["ip_address"],
+        public_key=row["public_key"],
+        private_key=row["private_key"],
+    )
+
+
+def _row_to_container(row: sqlite3.Row) -> Container:
+    return Container(
+        id=row["id"],
+        container_id=row["container_id"],
+        challenge_name=row["challenge_name"],
+        source_path=row["source_path"],
+        assigned_ip=row["assigned_ip"],
+        status=row["status"],
+    )
