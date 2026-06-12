@@ -23,3 +23,6 @@ Thumbs.db
 *.db-shm
 edo_clients/
 *.conf.bak
+
+#graphify
+graphify-out/
