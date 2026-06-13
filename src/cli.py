@@ -278,6 +278,10 @@ def cmd_remove_peer(args: argparse.Namespace, db: DatabaseManager) -> int:
 def cmd_summon(args: argparse.Namespace, db: DatabaseManager) -> int:
     if not gate_with_preflight("summon"):
         return 1
+    # Remember whether the path was supplied as a CLI arg — that's our
+    # signal for "interactive mode" downstream (we don't pop a hardening
+    # prompt when the operator already gave flags on the command line).
+    interactive = getattr(args, "path", None) is None
     raw = getattr(args, "path", None) or _ask(
         "Absolute path to challenge directory"
     )
@@ -303,6 +307,10 @@ def cmd_summon(args: argparse.Namespace, db: DatabaseManager) -> int:
 
     name = getattr(args, "name", None) or path.name
     profile = _build_security_profile(args)
+    if interactive and layout == "dockerfile":
+        # Surface the hardening menu only for the Dockerfile path —
+        # compose deployments ignore these flags anyway.
+        profile = _maybe_prompt_security(profile)
     _print(f"[*] Detected layout: {layout}. Summoning '{name}'...")
 
     if layout == "compose":
@@ -342,6 +350,70 @@ def _build_security_profile(args: argparse.Namespace) -> docker_mgr.SecurityProf
         cpus=getattr(args, "cpus", None),
         pids_limit=getattr(args, "pids_limit", None),
         restart_policy=getattr(args, "restart", None) or "unless-stopped",
+    )
+
+
+def _maybe_prompt_security(
+    default: docker_mgr.SecurityProfile,
+) -> docker_mgr.SecurityProfile:
+    """Interactive hardening prompt for the menu's summon flow.
+
+    Shows the default profile and lets the operator either accept it
+    (single keypress) or walk through resource-limit prompts. Capability
+    add/drop and ``--allow-setuid`` are intentionally CLI-only — they're
+    rare and easy to misuse without seeing the full context.
+    """
+    _print(f"\n[*] Default hardening: {default.summary()}", style="dim")
+    if not _confirm(
+        "Customise resource limits / read-only / restart policy?", default=False
+    ):
+        return default
+
+    _print("\n  Press Enter to keep the default shown in [brackets].", style="dim")
+
+    def _ask_int(label: str, current: Optional[int]) -> Optional[int]:
+        raw = _ask(f"  {label}", default=str(current) if current is not None else "")
+        return int(raw) if raw else None
+
+    def _ask_float(label: str, current: Optional[float]) -> Optional[float]:
+        raw = _ask(f"  {label}", default=str(current) if current is not None else "")
+        return float(raw) if raw else None
+
+    def _ask_str(label: str, current: Optional[str]) -> Optional[str]:
+        raw = _ask(f"  {label}", default=current or "")
+        return raw or None
+
+    memory = _ask_str("Memory cap (e.g. 512m, 1g)", default.memory)
+    try:
+        cpus = _ask_float("CPU cap (e.g. 1.0, 0.5)", default.cpus)
+        pids_limit = _ask_int("Max processes (pids-limit)", default.pids_limit)
+    except ValueError as e:
+        _print(f"[!] invalid number: {e} — keeping defaults", style="bold red")
+        cpus = default.cpus
+        pids_limit = default.pids_limit
+
+    read_only = _confirm("Read-only rootfs (with tmpfs /tmp)?", default=default.read_only_rootfs)
+
+    restart_choices = ("no", "on-failure", "unless-stopped", "always")
+    restart = _ask(
+        f"Restart policy {restart_choices}", default=default.restart_policy
+    )
+    if restart not in restart_choices:
+        _print(
+            f"[!] unknown restart policy '{restart}' — keeping {default.restart_policy}",
+            style="yellow",
+        )
+        restart = default.restart_policy
+
+    return docker_mgr.SecurityProfile(
+        no_new_privileges=default.no_new_privileges,
+        cap_drop=list(default.cap_drop),
+        cap_add=list(default.cap_add),
+        read_only_rootfs=read_only,
+        memory=memory,
+        cpus=cpus,
+        pids_limit=pids_limit,
+        restart_policy=restart,
     )
 
 
