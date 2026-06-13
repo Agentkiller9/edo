@@ -140,6 +140,29 @@ def resolve_client_dir(args: argparse.Namespace) -> Path:
     return wireguard.WG_CLIENTS_DIR
 
 
+def resolve_port(args: argparse.Namespace, interactive: bool) -> int:
+    """Pick the WireGuard listen port.
+
+    ``--port N`` on the command line wins. In interactive mode prompt with
+    the standard default so menu users can change it without leaving the
+    menu. Outside interactive mode, fall back silently to the default.
+    """
+    explicit = getattr(args, "port", None)
+    if explicit is not None:
+        return int(explicit)
+    if not interactive:
+        return wireguard.WG_LISTEN_PORT
+    raw = _ask("WireGuard listen port", default=str(wireguard.WG_LISTEN_PORT))
+    try:
+        return int(raw) if raw else wireguard.WG_LISTEN_PORT
+    except ValueError:
+        _print(
+            f"[!] invalid port '{raw}', using default {wireguard.WG_LISTEN_PORT}",
+            style="yellow",
+        )
+        return wireguard.WG_LISTEN_PORT
+
+
 def resolve_endpoint(args: argparse.Namespace) -> Optional[str]:
     """Return ``--endpoint`` if given, otherwise prompt with the interface list.
 
@@ -197,11 +220,12 @@ def cmd_init(args: argparse.Namespace, db: DatabaseManager) -> int:
     if not gate_with_preflight("init"):
         return 1
 
+    interactive = getattr(args, "endpoint", None) is None
     endpoint = resolve_endpoint(args)
     if not endpoint:
         _print("[!] endpoint required", style="bold red")
         return 2
-    port = int(getattr(args, "port", None) or wireguard.WG_LISTEN_PORT)
+    port = resolve_port(args, interactive)
 
     _print(f"[*] Initialising WireGuard server on {endpoint}:{port}")
     server = wireguard.init_server(endpoint=endpoint, port=port)
@@ -229,6 +253,10 @@ def cmd_init(args: argparse.Namespace, db: DatabaseManager) -> int:
 def cmd_add_peer(args: argparse.Namespace, db: DatabaseManager) -> int:
     if not gate_with_preflight("add-peer"):
         return 1
+    interactive = (
+        getattr(args, "username", None) is None
+        or getattr(args, "endpoint", None) is None
+    )
     username = getattr(args, "username", None) or _ask("Username")
     if not username:
         _print("[!] username required", style="bold red")
@@ -239,7 +267,7 @@ def cmd_add_peer(args: argparse.Namespace, db: DatabaseManager) -> int:
         _print("[!] endpoint required", style="bold red")
         return 2
 
-    port = int(getattr(args, "port", None) or wireguard.WG_LISTEN_PORT)
+    port = resolve_port(args, interactive)
     server = wireguard.init_server(endpoint=endpoint, port=port)
     clients_dir = resolve_client_dir(args)
 
@@ -305,7 +333,12 @@ def cmd_summon(args: argparse.Namespace, db: DatabaseManager) -> int:
         )
         return 2
 
-    name = getattr(args, "name", None) or path.name
+    default_name = path.name
+    name = getattr(args, "name", None)
+    if interactive and not name:
+        name = _ask("Challenge name", default=default_name) or default_name
+    if not name:
+        name = default_name
     profile = _build_security_profile(args)
     if interactive and layout == "dockerfile":
         # Surface the hardening menu only for the Dockerfile path —
@@ -405,10 +438,49 @@ def _maybe_prompt_security(
         )
         restart = default.restart_policy
 
+    # Advanced: capability tuning and the no-new-privileges escape hatch.
+    # Gated behind a second confirm so the common path stays short.
+    cap_drop = list(default.cap_drop)
+    cap_add = list(default.cap_add)
+    no_new_privileges = default.no_new_privileges
+    if _confirm(
+        "Tune Linux capabilities / setuid policy? (advanced)", default=False
+    ):
+        _print(
+            "  Comma-separated capability names (e.g. SYS_PTRACE, SETUID).",
+            style="dim",
+        )
+        _print(
+            "  See `man capabilities` for the full list. NET_RAW stays dropped.",
+            style="dim",
+        )
+        extra_drops_raw = _ask("Additional caps to drop", default="")
+        extra_drops = [
+            c.strip().upper()
+            for c in extra_drops_raw.split(",")
+            if c.strip()
+        ]
+        for cap in extra_drops:
+            if cap not in cap_drop:
+                cap_drop.append(cap)
+
+        extra_adds_raw = _ask("Caps to add", default=",".join(cap_add))
+        cap_add = [
+            c.strip().upper()
+            for c in extra_adds_raw.split(",")
+            if c.strip()
+        ]
+
+        no_new_privileges = not _confirm(
+            "Allow setuid escalation inside the container "
+            "(disable no-new-privileges)?",
+            default=not default.no_new_privileges,
+        )
+
     return docker_mgr.SecurityProfile(
-        no_new_privileges=default.no_new_privileges,
-        cap_drop=list(default.cap_drop),
-        cap_add=list(default.cap_add),
+        no_new_privileges=no_new_privileges,
+        cap_drop=cap_drop,
+        cap_add=cap_add,
         read_only_rootfs=read_only,
         memory=memory,
         cpus=cpus,
@@ -418,14 +490,22 @@ def _maybe_prompt_security(
 
 
 def cmd_release(args: argparse.Namespace, db: DatabaseManager) -> int:
-    if getattr(args, "all", False):
+    release_all = getattr(args, "all", False)
+    cid = getattr(args, "container", None)
+
+    # Interactive entry: neither --all nor --container was given on CLI.
+    # Surface the same choice the CLI flags expose so menu users aren't
+    # forced into single-container releases.
+    if not release_all and not cid:
+        release_all = _confirm("Release ALL containers?", default=False)
+        if not release_all:
+            cid = _ask("Container ID to release")
+
+    if release_all:
         n = docker_mgr.teardown_all(db)
         _print(f"[+] Released {n} vessel(s).", style="green")
         return 0
 
-    cid = getattr(args, "container", None)
-    if not cid:
-        cid = _ask("Container ID to release")
     if not cid:
         _print("[!] container id required (or use --all)", style="bold red")
         return 2
@@ -502,6 +582,7 @@ def cmd_purge(args: argparse.Namespace, db: Optional[DatabaseManager]) -> int:
     can be restored on the next ``init``. Pass ``--wipe-state`` to nuke
     those too (irreversible).
     """
+    wipe_state = getattr(args, "wipe_state", False)
     if not getattr(args, "yes", False):
         _print(
             "[*] This will remove ALL edo artifacts on this host:",
@@ -512,7 +593,7 @@ def cmd_purge(args: argparse.Namespace, db: Optional[DatabaseManager]) -> int:
         _print("      - EDO_FORWARD + EDO_INPUT iptables chains")
         _print("      - firewalld 51820/udp (if active)")
         _print("      - the wg0 interface (wg-quick down + systemd disable)")
-        if getattr(args, "wipe_state", False):
+        if wipe_state:
             _print(
                 "      - /etc/wireguard/wg0.conf + edo_clients/ + the SQLite DB",
                 style="bold red",
@@ -520,6 +601,19 @@ def cmd_purge(args: argparse.Namespace, db: Optional[DatabaseManager]) -> int:
         if not _confirm("Continue?", default=False):
             _print("[*] Aborted.", style="yellow")
             return 1
+        # Interactive parity for --wipe-state: only ask if the operator
+        # didn't already opt in on the command line.
+        if not wipe_state:
+            wipe_state = _confirm(
+                "Also delete state files (wg0.conf, client configs, SQLite DB)?",
+                default=False,
+            )
+            if wipe_state:
+                _print(
+                    "    [!] state deletion is irreversible; existing peers "
+                    "will need to be regenerated.",
+                    style="bold red",
+                )
 
     steps: List[Tuple[str, bool, str]] = []
 
@@ -579,7 +673,7 @@ def cmd_purge(args: argparse.Namespace, db: Optional[DatabaseManager]) -> int:
     )
 
     # 5. State files (only with --wipe-state).
-    if getattr(args, "wipe_state", False):
+    if wipe_state:
         _step(
             "/etc/wireguard/wg0.conf",
             lambda: _unlink(wireguard.WG_SERVER_CONFIG) or "ok",
@@ -733,12 +827,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_init = sub.add_parser("init", help="Initialise VPN + firewall")
     p_init.add_argument("--endpoint", help="Public endpoint for clients")
-    p_init.add_argument("--port", type=int, default=wireguard.WG_LISTEN_PORT)
+    p_init.add_argument("--port", type=int, default=None)
 
     p_add = sub.add_parser("add-peer", help="Bind a new participant")
     p_add.add_argument("username", nargs="?")
     p_add.add_argument("--endpoint", help="Public endpoint for clients")
-    p_add.add_argument("--port", type=int, default=wireguard.WG_LISTEN_PORT)
+    p_add.add_argument("--port", type=int, default=None)
 
     p_rem = sub.add_parser("remove-peer", help="Release a participant")
     p_rem.add_argument("username", nargs="?")
