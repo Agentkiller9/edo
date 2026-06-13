@@ -124,6 +124,34 @@ def show_banner() -> None:
         print(BANNER)
 
 
+# ---- shared helpers -----------------------------------------------------
+def resolve_endpoint(args: argparse.Namespace) -> Optional[str]:
+    """Return ``--endpoint`` if given, otherwise prompt with the interface list.
+
+    Shared by ``init`` and ``add-peer`` so both commands give the operator
+    the same "here are your IPs, pick one" UX without leaving the menu.
+    Returns ``None`` if the user gave nothing at all.
+    """
+    endpoint = getattr(args, "endpoint", None)
+    if endpoint:
+        return endpoint
+
+    ifaces = network.list_interface_ips()
+    default_ip: Optional[str] = None
+    if ifaces:
+        _print("\n[*] Detected interface IPs:")
+        for iface in ifaces:
+            tag = "  (default route)" if iface.is_default else ""
+            _print(f"      {iface.name:14} {iface.ipv4}{tag}")
+            if iface.is_default and not default_ip:
+                default_ip = iface.ipv4
+        _print("")
+    return _ask(
+        "Public endpoint clients will dial",
+        default=default_ip,
+    ) or None
+
+
 # ---- commands -----------------------------------------------------------
 def cmd_doctor(args: argparse.Namespace, db: DatabaseManager) -> int:
     """Diagnose the host: required binaries, kernel module, daemons, network."""
@@ -154,25 +182,7 @@ def cmd_init(args: argparse.Namespace, db: DatabaseManager) -> int:
     if not gate_with_preflight("init"):
         return 1
 
-    endpoint = getattr(args, "endpoint", None)
-    if not endpoint:
-        # Show the operator their interface IPs so they can pick one
-        # without leaving the menu. Default the prompt to the
-        # default-route interface's IP since that's almost always right.
-        ifaces = network.list_interface_ips()
-        default_ip: Optional[str] = None
-        if ifaces:
-            _print("\n[*] Detected interface IPs:")
-            for iface in ifaces:
-                tag = "  (default route)" if iface.is_default else ""
-                _print(f"      {iface.name:14} {iface.ipv4}{tag}")
-                if iface.is_default and not default_ip:
-                    default_ip = iface.ipv4
-            _print("")
-        endpoint = _ask(
-            "Public endpoint clients will dial",
-            default=default_ip,
-        )
+    endpoint = resolve_endpoint(args)
     if not endpoint:
         _print("[!] endpoint required", style="bold red")
         return 2
@@ -209,9 +219,7 @@ def cmd_add_peer(args: argparse.Namespace, db: DatabaseManager) -> int:
         _print("[!] username required", style="bold red")
         return 2
 
-    endpoint = getattr(args, "endpoint", None) or _ask(
-        "Public endpoint clients will dial"
-    )
+    endpoint = resolve_endpoint(args)
     if not endpoint:
         _print("[!] endpoint required", style="bold red")
         return 2
