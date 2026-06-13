@@ -218,6 +218,8 @@ def cmd_add_peer(args: argparse.Namespace, db: DatabaseManager) -> int:
 
 
 def cmd_remove_peer(args: argparse.Namespace, db: DatabaseManager) -> int:
+    if not gate_with_preflight("remove-peer"):
+        return 1
     username = getattr(args, "username", None) or _ask("Username")
     if not username:
         _print("[!] username required", style="bold red")

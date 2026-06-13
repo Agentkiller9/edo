@@ -435,6 +435,50 @@ def check_wg_port_accepted(port: int = 51820) -> Check:
     )
 
 
+def check_wg_interface_up(interface: str = "wg0") -> Check:
+    """Stricter than :func:`check_wg_interface_state` — fails if the
+    interface is missing or down. Used as a gate on commands that mutate
+    live peer state (``add-peer`` / ``remove-peer``); without ``wg0`` up,
+    those commands change config files on disk but produce clients that
+    can never handshake.
+    """
+    if not shutil.which("wg"):
+        return Check(
+            f"{interface} up",
+            False,
+            Severity.CRITICAL,
+            detail="wg command missing",
+            hint=install_hint("wg"),
+        )
+    try:
+        proc = subprocess.run(
+            ["wg", "show", interface],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as e:
+        return Check(
+            f"{interface} up", False, Severity.CRITICAL, detail=str(e)
+        )
+    if proc.returncode == 0:
+        return Check(
+            f"{interface} up", True, Severity.INFO, detail="up and configured"
+        )
+    stderr = (proc.stderr or "").strip() or "interface not running"
+    return Check(
+        f"{interface} up",
+        False,
+        Severity.CRITICAL,
+        detail=stderr,
+        hint=(
+            f"bring it up: `sudo edo init --endpoint <host>` (idempotent), or "
+            f"`sudo wg-quick up {interface}` directly. To survive reboots: "
+            f"`sudo systemctl enable wg-quick@{interface}`"
+        ),
+    )
+
+
 def check_wg_interface_state(interface: str = "wg0") -> Check:
     if not shutil.which("ip"):
         return Check(
@@ -515,6 +559,13 @@ def quick_checks_for(command: str) -> PreflightReport:
         for b in ("wg", "wg-quick", "iptables", "ip"):
             report.checks.append(check_binary(b))
         report.checks.append(check_kernel_module("wireguard"))
+
+    if command in {"add-peer", "remove-peer"}:
+        # Without wg0 actually running, add-peer happily updates the config
+        # file and DB but the generated client config can never handshake.
+        # Same goes for remove-peer — the DB drop "succeeds" while the live
+        # peer entry stays around until wg-quick down/up.
+        report.checks.append(check_wg_interface_up())
 
     if command == "add-peer":
         # Most common silent failure mode for add-peer: port isn't open,
