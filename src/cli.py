@@ -153,9 +153,26 @@ def cmd_doctor(args: argparse.Namespace, db: DatabaseManager) -> int:
 def cmd_init(args: argparse.Namespace, db: DatabaseManager) -> int:
     if not gate_with_preflight("init"):
         return 1
-    endpoint = getattr(args, "endpoint", None) or _ask(
-        "Public endpoint clients will dial"
-    )
+
+    endpoint = getattr(args, "endpoint", None)
+    if not endpoint:
+        # Show the operator their interface IPs so they can pick one
+        # without leaving the menu. Default the prompt to the
+        # default-route interface's IP since that's almost always right.
+        ifaces = network.list_interface_ips()
+        default_ip: Optional[str] = None
+        if ifaces:
+            _print("\n[*] Detected interface IPs:")
+            for iface in ifaces:
+                tag = "  (default route)" if iface.is_default else ""
+                _print(f"      {iface.name:14} {iface.ipv4}{tag}")
+                if iface.is_default and not default_ip:
+                    default_ip = iface.ipv4
+            _print("")
+        endpoint = _ask(
+            "Public endpoint clients will dial",
+            default=default_ip,
+        )
     if not endpoint:
         _print("[!] endpoint required", style="bold red")
         return 2
@@ -352,6 +369,163 @@ def cmd_status(args: argparse.Namespace, db: DatabaseManager) -> int:
     return 0
 
 
+def cmd_purge(args: argparse.Namespace, db: Optional[DatabaseManager]) -> int:
+    """Aggressively remove every artifact edo has ever installed on the host.
+
+    Use this when the host is in an unknown state — leftover iptables
+    chains, a stale docker bridge, half-running wg interface, orphan
+    containers from a previous edo version. Every step is idempotent and
+    error-tolerant; we keep going past individual failures and report the
+    score at the end.
+
+    By default the DB and on-disk client configs are preserved so peers
+    can be restored on the next ``init``. Pass ``--wipe-state`` to nuke
+    those too (irreversible).
+    """
+    if not getattr(args, "yes", False):
+        _print(
+            "[*] This will remove ALL edo artifacts on this host:",
+            style="bold yellow",
+        )
+        _print("      - every container labelled edo.managed=true")
+        _print("      - the edo_br0 docker network")
+        _print("      - EDO_FORWARD + EDO_INPUT iptables chains")
+        _print("      - firewalld 51820/udp (if active)")
+        _print("      - the wg0 interface (wg-quick down + systemd disable)")
+        if getattr(args, "wipe_state", False):
+            _print(
+                "      - /etc/wireguard/wg0.conf + edo_clients/ + the SQLite DB",
+                style="bold red",
+            )
+        if not _confirm("Continue?", default=False):
+            _print("[*] Aborted.", style="yellow")
+            return 1
+
+    steps: List[Tuple[str, bool, str]] = []
+
+    def _step(name: str, fn: Callable[[], Optional[str]]) -> None:
+        try:
+            detail = fn() or ""
+            steps.append((name, True, detail))
+            _print(f"[+] {name}  {detail}", style="green")
+        except Exception as e:
+            steps.append((name, False, str(e)))
+            _print(f"[!] {name}  failed: {e}", style="yellow")
+
+    # 1. Containers labelled edo.managed=true (catches anything the DB
+    #    doesn't know about — e.g. survived a DB wipe).
+    def _kill_containers() -> str:
+        try:
+            import docker as _d
+
+            client = _d.from_env()
+            cs = client.containers.list(
+                all=True, filters={"label": "edo.managed=true"}
+            )
+            for c in cs:
+                try:
+                    c.remove(force=True)
+                except _d.errors.APIError as e:
+                    logger.warning("could not remove %s: %s", c.short_id, e)
+            # Also flush DB rows so `status` doesn't lie.
+            if db is not None:
+                for ct in db.get_active_containers():
+                    db.remove_container(ct.container_id)
+            return f"removed {len(cs)} container(s)"
+        except ImportError:
+            return "docker SDK not installed — skipped"
+
+    _step("containers", _kill_containers)
+
+    # 2. Docker network.
+    _step(
+        "docker network edo_br0",
+        lambda: "removed" if docker_mgr.remove_network() else "not present",
+    )
+
+    # 3. Firewall: iptables chains + firewalld port.
+    def _wipe_firewall() -> str:
+        results = network.remove_firewall(wg_port=wireguard.WG_LISTEN_PORT)
+        ok = sum(1 for r in results if r.success)
+        return f"{ok}/{len(results)} rule ops succeeded"
+
+    _step("firewall rules", _wipe_firewall)
+
+    # 4. WireGuard interface + systemd unit.
+    _step("wg0 down", lambda: (wireguard.bring_down(), "")[1] or "ok")
+    _step(
+        "wg-quick@wg0 disabled",
+        lambda: _systemctl_disable("wg-quick@wg0") or "ok",
+    )
+
+    # 5. State files (only with --wipe-state).
+    if getattr(args, "wipe_state", False):
+        _step(
+            "/etc/wireguard/wg0.conf",
+            lambda: _unlink(wireguard.WG_SERVER_CONFIG) or "ok",
+        )
+        _step(
+            "/etc/wireguard/edo_clients/",
+            lambda: _rmtree(wireguard.WG_CLIENTS_DIR) or "ok",
+        )
+        if db is not None:
+            db_path = Path(getattr(args, "db", None) or "/var/lib/edo/edo.db")
+            _step(f"sqlite DB {db_path}", lambda: _unlink(db_path) or "ok")
+
+    failed = [name for name, ok, _ in steps if not ok]
+    if failed:
+        _print(
+            f"\n[!] Purge finished with {len(failed)} failure(s): {', '.join(failed)}",
+            style="bold yellow",
+        )
+        _print(
+            "    Most failures are benign (e.g. 'already absent'); re-run with --verbose for tracebacks.",
+            style="dim",
+        )
+        return 1
+    _print("\n[+] Purge complete. Host is back to a clean slate.", style="bold green")
+    return 0
+
+
+def _systemctl_disable(unit: str) -> Optional[str]:
+    """Best-effort `systemctl disable`. Returns a brief note on success."""
+    import subprocess as _sp
+
+    if not _sp.run(["systemctl", "list-unit-files", unit], capture_output=True).stdout.strip():
+        return "unit not present"
+    try:
+        _sp.run(
+            ["systemctl", "disable", "--now", unit],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except _sp.CalledProcessError as e:
+        # `disable` fails if the unit is masked or already disabled. We
+        # treat the second case as success.
+        stderr = (e.stderr or "").lower()
+        if "not enabled" in stderr or "no such unit" in stderr:
+            return "already disabled"
+        raise
+    return "disabled"
+
+
+def _unlink(path: Path) -> Optional[str]:
+    if not path.exists():
+        return "not present"
+    path.unlink()
+    return "removed"
+
+
+def _rmtree(path: Path) -> Optional[str]:
+    import shutil as _sh
+
+    if not path.exists():
+        return "not present"
+    _sh.rmtree(path)
+    return "removed"
+
+
 def cmd_teardown(args: argparse.Namespace, db: DatabaseManager) -> int:
     if not getattr(args, "yes", False):
         if not _confirm(
@@ -386,6 +560,7 @@ def interactive_menu(db: DatabaseManager, args: argparse.Namespace) -> int:
         "5": ("Initialise / re-apply infrastructure", cmd_init),
         "6": ("Lift the seal (teardown everything)", cmd_teardown),
         "7": ("Diagnose host (edo doctor)", cmd_doctor),
+        "8": ("Purge — deep cleanup of every edo artifact", cmd_purge),
         "q": ("Quit", None),
     }
 
@@ -463,6 +638,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-runtime",
         action="store_true",
         help="Skip checks that touch running services (docker daemon, port bind)",
+    )
+
+    p_purge = sub.add_parser(
+        "purge",
+        help="Deep cleanup of every artifact edo has installed on the host",
+    )
+    p_purge.add_argument(
+        "--yes", "-y", action="store_true", help="Skip confirmation"
+    )
+    p_purge.add_argument(
+        "--wipe-state",
+        action="store_true",
+        help="Also delete /etc/wireguard/wg0.conf, edo_clients/, and the SQLite DB",
     )
 
     return p
@@ -556,6 +744,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "status": cmd_status,
         "teardown": cmd_teardown,
         "doctor": cmd_doctor,
+        "purge": cmd_purge,
     }
 
     if args.command in dispatch:

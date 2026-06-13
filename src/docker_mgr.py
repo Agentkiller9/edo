@@ -168,14 +168,50 @@ def detect_layout(path: Path) -> Optional[str]:
 
 
 # ---- network management -------------------------------------------------
-def ensure_network() -> str:
-    """Create the dedicated edo bridge network if it doesn't already exist.
+#
+# We create edo_br0 in Docker's **routed gateway mode**
+# (com.docker.network.bridge.gateway_mode_ipv4=routed, Docker 24+). In this
+# mode:
+#
+#   * Docker does NOT install masquerade/SNAT for the bridge — containers
+#     reach the WG subnet with their real 10.9.0.x addresses, which is
+#     what makes reverse shells work (the catcher sees the true source).
+#   * Docker does NOT subject this bridge to DOCKER-FORWARD's default-deny
+#     filtering — wg0→edo_br0 traffic isn't blocked by Docker's own chain
+#     ordering trick. (Our EDO_FORWARD rules still enforce isolation and
+#     egress containment.)
+#   * Outbound from containers retains the source IP, so participants can
+#     ping containers and containers can ping participants directly.
+#
+# Pre-existing edo_br0 networks created by older edo versions are in
+# legacy NAT mode. ``ensure_network`` detects that and refuses to use them
+# silently — operators must teardown/purge so the bridge can be recreated
+# routed.
+def _network_is_routed(net: "docker.models.networks.Network") -> bool:
+    opts = (net.attrs.get("Options") or {})
+    return opts.get("com.docker.network.bridge.gateway_mode_ipv4") == "routed"
 
-    Returns the network ID.
+
+def ensure_network() -> str:
+    """Create the dedicated edo bridge in routed gateway mode.
+
+    Returns the network ID. Raises ``RuntimeError`` if a legacy
+    (non-routed) edo_br0 already exists — recreating it in place would
+    disrupt running containers, so we make the operator opt in via
+    ``edo purge``.
     """
     client = _client()
     try:
-        return client.networks.get(DOCKER_BRIDGE).id
+        existing = client.networks.get(DOCKER_BRIDGE)
+        if _network_is_routed(existing):
+            return existing.id
+        raise RuntimeError(
+            f"docker network '{DOCKER_BRIDGE}' exists but is in legacy NAT mode.\n"
+            "  Reverse shells and direct pings won't work cleanly until the bridge\n"
+            "  is recreated in routed mode. To migrate:\n"
+            "    sudo python3 edo.py purge        # stops edo containers, removes the bridge\n"
+            "    sudo python3 edo.py init ...     # recreates in routed mode"
+        )
     except NotFound:
         pass
 
@@ -183,14 +219,35 @@ def ensure_network() -> str:
         subnet=str(DOCKER_SUBNET), gateway=DOCKER_GATEWAY_IP
     )
     ipam_config = docker.types.IPAMConfig(pool_configs=[ipam_pool])
-    net = client.networks.create(
-        name=DOCKER_BRIDGE,
-        driver="bridge",
-        ipam=ipam_config,
-        options={"com.docker.network.bridge.name": DOCKER_BRIDGE},
-        check_duplicate=True,
+    options = {
+        "com.docker.network.bridge.name": DOCKER_BRIDGE,
+        # Routed mode (Docker 24+). The daemon will reject this option on
+        # older versions — we surface a clean message rather than letting
+        # the SDK exception escape.
+        "com.docker.network.bridge.gateway_mode_ipv4": "routed",
+    }
+    try:
+        net = client.networks.create(
+            name=DOCKER_BRIDGE,
+            driver="bridge",
+            ipam=ipam_config,
+            options=options,
+            check_duplicate=True,
+        )
+    except APIError as e:
+        msg = str(e)
+        if "gateway_mode" in msg or "unknown option" in msg.lower():
+            raise RuntimeError(
+                "Docker rejected the routed-mode option. routed bridges require "
+                "Docker 24.0+ — upgrade Docker on this host. Current error: "
+                f"{msg}"
+            ) from e
+        raise
+    logger.info(
+        "created docker network %s on %s (routed mode)",
+        DOCKER_BRIDGE,
+        DOCKER_SUBNET,
     )
-    logger.info("created docker network %s on %s", DOCKER_BRIDGE, DOCKER_SUBNET)
     return net.id
 
 

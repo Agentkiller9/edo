@@ -74,6 +74,44 @@ def _run(cmd: List[str], check: bool = True) -> subprocess.CompletedProcess:
         ) from e
 
 
+@dataclass
+class InterfaceInfo:
+    name: str
+    ipv4: str
+    is_default: bool = False
+
+
+def list_interface_ips() -> List[InterfaceInfo]:
+    """Enumerate up interfaces that have an IPv4 address.
+
+    Marks the one that owns the default route as ``is_default=True``.
+    """
+    try:
+        proc = _run(["ip", "-4", "-o", "addr", "show"], check=False)
+    except RuntimeError:
+        return []
+
+    default_iface = get_public_interface()
+    skip = {"lo"}
+    seen: List[InterfaceInfo] = []
+    for line in proc.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 4 or parts[2] != "inet":
+            continue
+        name = parts[1]
+        if name in skip:
+            continue
+        ipv4 = parts[3].split("/", 1)[0]
+        # Drop the docker/wg interfaces edo manages — they aren't valid
+        # client-facing endpoints.
+        if name in {WG_INTERFACE, DOCKER_BRIDGE} or name.startswith(("br-", "docker", "veth")):
+            continue
+        seen.append(
+            InterfaceInfo(name=name, ipv4=ipv4, is_default=name == default_iface)
+        )
+    return seen
+
+
 def get_public_interface() -> Optional[str]:
     """Resolve the host's default-route interface.
 

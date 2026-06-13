@@ -13,7 +13,7 @@ lives in SQLite, traffic is policed by `iptables` from a dedicated chain.
 ## What it gives you
 
 - **Per-participant WireGuard peers** with auto-allocated IPs (`10.8.0.0/24`).
-- **Per-challenge containers** with static IPs on `edo_br0` (`10.9.0.0/24`).
+- **Per-challenge containers** with static IPs on `edo_br0` (`10.9.0.0/24`), created in Docker's **routed gateway mode** (Docker 24+) so containers keep their real IPs through the tunnel — `ping` works both ways and reverse shells see the actual VPN source IP.
 - **Client isolation** — participants cannot see each other on the VPN.
 - **Egress containment** — challenge containers cannot reach the public internet.
 - **Reverse-shell channel** — containers _can_ originate connections back to
@@ -131,7 +131,8 @@ Run `sudo edo` with no arguments for the menu:
 | `edo release --container ID` | Stop + remove a single container. |
 | `edo release --all` | Stop + remove every container `edo` knows about. |
 | `edo status` | Print the bound peers and running containers as tables. |
-| `edo teardown [--yes]` | Release every container, remove the bridge, lift the firewall, bring `wg0` down. |
+| `edo teardown [--yes]` | Release every container, remove the bridge, lift the firewall, bring `wg0` down. State (server config, client configs, DB) is preserved so the next `init` restores everything. |
+| `edo purge [--yes] [--wipe-state]` | Deep cleanup. Like `teardown`, but also: removes every container labelled `edo.managed=true`, disables `wg-quick@wg0.service`, strips any leftover `EDO_FORWARD`/`EDO_INPUT` chains. Add `--wipe-state` to also delete `/etc/wireguard/wg0.conf`, the client configs, and the SQLite DB. Use when the host is in an unknown state or you're migrating bridge modes. |
 | `edo menu` | Open the interactive menu (this is also the default with no command). |
 | `edo doctor [--no-runtime]` | Diagnose the host: required binaries, kernel module, default route, docker daemon, port availability. Runs as non-root so you can spot the missing pieces *before* `sudo`. |
 
