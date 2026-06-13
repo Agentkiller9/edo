@@ -139,6 +139,7 @@ Run `sudo edo` with no arguments for the menu:
 Global flags:
 
 - `--db PATH` — override SQLite path (default `/var/lib/edo/edo.db`).
+- `--client-dir PATH` — where to write generated client `.conf` files. Defaults to `/etc/wireguard/edo_clients/`, or the value of `$EDO_CLIENT_CONFIG_DIR` if set. Used by `add-peer`, `remove-peer`, and `purge --wipe-state`. Useful when you want configs in `/home/operator/ctf-configs/` so `scp`/`rsync` to participants doesn't need `sudo`.
 - `--verbose / -v` — enable DEBUG logging.
 
 ---

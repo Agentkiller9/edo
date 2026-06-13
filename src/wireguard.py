@@ -25,6 +25,9 @@ logger = logging.getLogger(__name__)
 
 WG_CONFIG_DIR = Path("/etc/wireguard")
 WG_SERVER_CONFIG = WG_CONFIG_DIR / f"{WG_INTERFACE}.conf"
+# Default destination for generated client .conf files. Operators can
+# override per-invocation with --client-dir or globally via the
+# EDO_CLIENT_CONFIG_DIR environment variable; both are wired in cli.py.
 WG_CLIENTS_DIR = WG_CONFIG_DIR / "edo_clients"
 WG_LISTEN_PORT = 51820
 
@@ -151,9 +154,16 @@ def _load_server_config(endpoint: str, port: int) -> ServerConfig:
 
 # ---- peer lifecycle -----------------------------------------------------
 def add_peer(
-    db: DatabaseManager, username: str, server: ServerConfig
+    db: DatabaseManager,
+    username: str,
+    server: ServerConfig,
+    clients_dir: Optional[Path] = None,
 ) -> ClientConfig:
     """Allocate, persist, write, and live-apply a new peer.
+
+    ``clients_dir`` controls where the generated ``<username>.conf`` is
+    written. Defaults to :data:`WG_CLIENTS_DIR`. The directory is created
+    (with 0700) if missing.
 
     Rolls back the DB record if any config/live-apply step raises.
     """
@@ -169,12 +179,18 @@ def add_peer(
         private_key=kp.private_key,
     )
 
+    out_dir = Path(clients_dir) if clients_dir is not None else WG_CLIENTS_DIR
     try:
         _append_peer_to_server_config(peer)
         _live_add_peer(peer)
         client_text = _render_client_config(peer, server)
-        WG_CLIENTS_DIR.mkdir(parents=True, exist_ok=True)
-        out_path = WG_CLIENTS_DIR / f"{username}.conf"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            out_dir.chmod(0o700)
+        except OSError:
+            # Operator may have explicitly looser perms on a shared dir.
+            pass
+        out_path = out_dir / f"{username}.conf"
         out_path.write_text(client_text)
         out_path.chmod(0o600)
     except Exception:
@@ -185,7 +201,11 @@ def add_peer(
     return ClientConfig(peer=peer, config_text=client_text, config_path=out_path)
 
 
-def remove_peer(db: DatabaseManager, username: str) -> bool:
+def remove_peer(
+    db: DatabaseManager,
+    username: str,
+    clients_dir: Optional[Path] = None,
+) -> bool:
     """Remove a peer from DB, server config, live interface, and disk."""
     peer = db.get_peer(username)
     if not peer:
@@ -204,7 +224,8 @@ def remove_peer(db: DatabaseManager, username: str) -> bool:
     _rewrite_server_config(db, exclude_username=username)
     db.remove_peer(username)
 
-    client_conf = WG_CLIENTS_DIR / f"{username}.conf"
+    out_dir = Path(clients_dir) if clients_dir is not None else WG_CLIENTS_DIR
+    client_conf = out_dir / f"{username}.conf"
     if client_conf.exists():
         client_conf.unlink()
     return True

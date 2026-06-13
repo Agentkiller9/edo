@@ -125,6 +125,21 @@ def show_banner() -> None:
 
 
 # ---- shared helpers -----------------------------------------------------
+def resolve_client_dir(args: argparse.Namespace) -> Path:
+    """Where do generated client configs land for this invocation?
+
+    Precedence: ``--client-dir`` flag > ``EDO_CLIENT_CONFIG_DIR`` env >
+    the wireguard module's default (``/etc/wireguard/edo_clients/``).
+    """
+    explicit = getattr(args, "client_dir", None)
+    if explicit:
+        return Path(explicit).expanduser()
+    env = os.environ.get("EDO_CLIENT_CONFIG_DIR")
+    if env:
+        return Path(env).expanduser()
+    return wireguard.WG_CLIENTS_DIR
+
+
 def resolve_endpoint(args: argparse.Namespace) -> Optional[str]:
     """Return ``--endpoint`` if given, otherwise prompt with the interface list.
 
@@ -226,9 +241,12 @@ def cmd_add_peer(args: argparse.Namespace, db: DatabaseManager) -> int:
 
     port = int(getattr(args, "port", None) or wireguard.WG_LISTEN_PORT)
     server = wireguard.init_server(endpoint=endpoint, port=port)
+    clients_dir = resolve_client_dir(args)
 
     try:
-        cc = wireguard.add_peer(db, username=username, server=server)
+        cc = wireguard.add_peer(
+            db, username=username, server=server, clients_dir=clients_dir
+        )
     except ValueError as e:
         _print(f"[!] {e}", style="bold red")
         return 2
@@ -249,7 +267,7 @@ def cmd_remove_peer(args: argparse.Namespace, db: DatabaseManager) -> int:
     if not username:
         _print("[!] username required", style="bold red")
         return 2
-    ok = wireguard.remove_peer(db, username)
+    ok = wireguard.remove_peer(db, username, clients_dir=resolve_client_dir(args))
     if ok:
         _print(f"[+] Released vessel '{username}'.", style="green")
         return 0
@@ -472,9 +490,10 @@ def cmd_purge(args: argparse.Namespace, db: Optional[DatabaseManager]) -> int:
             "/etc/wireguard/wg0.conf",
             lambda: _unlink(wireguard.WG_SERVER_CONFIG) or "ok",
         )
+        clients_dir = resolve_client_dir(args)
         _step(
-            "/etc/wireguard/edo_clients/",
-            lambda: _rmtree(wireguard.WG_CLIENTS_DIR) or "ok",
+            f"client configs ({clients_dir})",
+            lambda: _rmtree(clients_dir) or "ok",
         )
         if db is not None:
             db_path = Path(getattr(args, "db", None) or "/var/lib/edo/edo.db")
@@ -605,6 +624,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="Path to SQLite DB (default: /var/lib/edo/edo.db)",
+    )
+    p.add_argument(
+        "--client-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory to write generated client .conf files into. "
+            "Default: /etc/wireguard/edo_clients/ (or $EDO_CLIENT_CONFIG_DIR)"
+        ),
     )
     p.add_argument("--verbose", "-v", action="store_true")
     sub = p.add_subparsers(dest="command")
