@@ -305,6 +305,47 @@ def _build_chain_rules(public_iface: str) -> List[List[str]]:
     ]
 
 
+# Hook precedence: DOCKER-USER is the chain Docker promises to preserve at
+# position 1 of FORWARD across daemon restarts. Hooking EDO_FORWARD into
+# DOCKER-USER (rather than FORWARD directly) survives `systemctl restart
+# docker` — otherwise Docker re-inserts its own DOCKER-USER / DOCKER-FORWARD
+# chains at the top and pushes our hook down past DOCKER-FORWARD, which
+# silently drops wg0→edo_br0 traffic before it can be ACCEPTed by us.
+_FORWARD_HOOK_CANDIDATES = ("DOCKER-USER", "FORWARD")
+
+
+def _preferred_forward_hook() -> str:
+    """Pick the highest-priority chain we can attach EDO_FORWARD into.
+
+    Prefers DOCKER-USER when present; falls back to FORWARD on hosts where
+    Docker isn't installed (yet).
+    """
+    for chain in _FORWARD_HOOK_CANDIDATES:
+        if _chain_exists(chain):
+            return chain
+    return "FORWARD"
+
+
+def _unhook_edo_from_all() -> List[RuleResult]:
+    """Remove EDO_FORWARD's jump from every place it might have been hooked.
+
+    Idempotent. Used both during teardown and at the top of apply_firewall
+    so re-`init` always lands the hook in a single, known location.
+    """
+    results: List[RuleResult] = []
+    for chain in _FORWARD_HOOK_CANDIDATES:
+        if not _chain_exists(chain):
+            continue
+        hook = [chain, "-j", EDO_CHAIN]
+        # Defensive while-loop: in pathological states the hook could exist
+        # more than once (e.g. operator manually duplicated it).
+        guard = 0
+        while _iptables_check(hook) and guard < 5:
+            results.append(_iptables_delete(hook))
+            guard += 1
+    return results
+
+
 # ---- public API ---------------------------------------------------------
 def apply_firewall(wg_port: int = 51820) -> FirewallApplyResult:
     """Idempotently install all edo firewall rules.
@@ -336,15 +377,20 @@ def apply_firewall(wg_port: int = 51820) -> FirewallApplyResult:
     # parsing stderr.
     subprocess.run(["iptables", "-N", EDO_CHAIN], capture_output=True, text=True)
 
-    # Hook EDO_FORWARD at position 1 of FORWARD if not already hooked.
-    hook = ["FORWARD", "-j", EDO_CHAIN]
-    if not _iptables_check(hook):
-        try:
-            _run(["iptables", "-I", "FORWARD", "1", "-j", EDO_CHAIN])
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(
-                f"failed to hook {EDO_CHAIN} into FORWARD: {(e.stderr or '').strip()}"
-            ) from e
+    # Always re-hook in a known position. Strip stale hooks (e.g. from a
+    # prior init where Docker wasn't yet installed) and re-insert into the
+    # preferred chain at position 1. This makes init idempotent AND
+    # self-healing: re-running `edo init` after Docker shoves us down
+    # restores the correct precedence.
+    _unhook_edo_from_all()
+    target = _preferred_forward_hook()
+    try:
+        _run(["iptables", "-I", target, "1", "-j", EDO_CHAIN])
+        logger.info("hooked %s at position 1 of %s", EDO_CHAIN, target)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(
+            f"failed to hook {EDO_CHAIN} into {target}: {(e.stderr or '').strip()}"
+        ) from e
 
     # Start clean: flush prior contents of our chain. Anything previously
     # added by edo is now gone.
@@ -392,10 +438,9 @@ def apply_firewall(wg_port: int = 51820) -> FirewallApplyResult:
 
 def remove_firewall(wg_port: int = 51820) -> List[RuleResult]:
     """Unhook, flush, and delete the edo chains. Idempotent."""
-    results: List[RuleResult] = []
-    hook = ["FORWARD", "-j", EDO_CHAIN]
-    if _iptables_check(hook):
-        results.append(_iptables_delete(hook))
+    # Strip our hook from both FORWARD and DOCKER-USER — we don't know which
+    # chain holds it, and prior versions of edo used FORWARD directly.
+    results: List[RuleResult] = list(_unhook_edo_from_all())
 
     if _chain_exists(EDO_CHAIN):
         try:

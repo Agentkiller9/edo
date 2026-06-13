@@ -389,6 +389,83 @@ def check_docker_subnet_clear() -> Check:
         )
 
 
+def check_edo_chain_precedence() -> Check:
+    """Verify ``EDO_FORWARD`` is hooked into the right place.
+
+    On hosts with Docker installed, Docker re-inserts its own
+    ``DOCKER-USER`` and ``DOCKER-FORWARD`` chains at the top of FORWARD on
+    every restart. If ``EDO_FORWARD`` is hooked into FORWARD directly, it
+    ends up *after* ``DOCKER-FORWARD`` and our rules never fire because
+    Docker's chain drops wg0→edo_br0 traffic first. Detects that case and
+    points at the fix.
+    """
+    if not shutil.which("iptables"):
+        return Check(
+            "EDO_FORWARD precedence",
+            False,
+            Severity.WARNING,
+            detail="iptables binary missing",
+            hint=install_hint("iptables"),
+        )
+    try:
+        forward = subprocess.run(
+            ["iptables", "-L", "FORWARD", "-n", "--line-numbers"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        docker_user = subprocess.run(
+            ["iptables", "-L", "DOCKER-USER", "-n", "--line-numbers"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as e:
+        return Check(
+            "EDO_FORWARD precedence", False, Severity.WARNING, detail=str(e)
+        )
+
+    in_docker_user = (
+        docker_user.returncode == 0 and "EDO_FORWARD" in docker_user.stdout
+    )
+    in_forward = forward.returncode == 0 and "EDO_FORWARD" in forward.stdout
+    docker_installed = docker_user.returncode == 0
+
+    if in_docker_user:
+        return Check(
+            "EDO_FORWARD precedence",
+            True,
+            Severity.INFO,
+            detail="hooked in DOCKER-USER (survives docker restarts)",
+        )
+    if in_forward and docker_installed:
+        return Check(
+            "EDO_FORWARD precedence",
+            False,
+            Severity.CRITICAL,
+            detail="hooked in FORWARD but DOCKER-USER exists — Docker's chains will run first",
+            hint=(
+                "re-run `edo init` to fix automatically, or manually: "
+                "`sudo iptables -D FORWARD -j EDO_FORWARD && "
+                "sudo iptables -I DOCKER-USER 1 -j EDO_FORWARD`"
+            ),
+        )
+    if in_forward:
+        return Check(
+            "EDO_FORWARD precedence",
+            True,
+            Severity.INFO,
+            detail="hooked in FORWARD (Docker not installed — acceptable)",
+        )
+    return Check(
+        "EDO_FORWARD precedence",
+        False,
+        Severity.WARNING,
+        detail="EDO_FORWARD is not hooked into any chain",
+        hint="run `edo init` to install the firewall",
+    )
+
+
 def check_wg_port_accepted(port: int = 51820) -> Check:
     """Verify the WireGuard handshake port is reachable on INPUT.
 
@@ -542,6 +619,7 @@ def run_all_checks(include_runtime: bool = True) -> PreflightReport:
         report.checks.append(check_wg_interface_state())
         report.checks.append(check_port_free(51820, "udp"))
         report.checks.append(check_wg_port_accepted(51820))
+        report.checks.append(check_edo_chain_precedence())
 
     return report
 

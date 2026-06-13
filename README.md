@@ -155,13 +155,12 @@ Global flags:
                    challenge containers
 ```
 
-edo installs rules in **two dedicated iptables chains**, each hooked at
-position 1 of its parent so policy elsewhere is never disturbed:
+edo installs rules in **two dedicated iptables chains**:
 
 | Chain | Hooked into | Purpose |
 | --- | --- | --- |
-| `EDO_FORWARD` | `FORWARD` | The three forwarding guarantees below. |
-| `EDO_INPUT`   | `INPUT`   | Accept the WireGuard handshake on `udp/51820`. Installed only when firewalld is *not* the active firewall — when firewalld is active, `edo init` runs `firewall-cmd --add-port=51820/udp --permanent` instead so a reload doesn't wipe it. |
+| `EDO_FORWARD` | `DOCKER-USER` (preferred), else `FORWARD` | The three forwarding guarantees below. Hooked into `DOCKER-USER` when Docker is installed so the rules survive `systemctl restart docker` — Docker preserves `DOCKER-USER`'s place at the top of `FORWARD`, which keeps our hook ahead of Docker's `DOCKER-FORWARD` chain (whose default behaviour will silently drop wg0→edo_br0 traffic). `edo doctor` flags this if the hook ever ends up in the wrong place. |
+| `EDO_INPUT`   | `INPUT` | Accept the WireGuard handshake on `udp/51820`. Installed only when firewalld is *not* the active firewall — when firewalld is active, `edo init` runs `firewall-cmd --add-port=51820/udp --permanent` instead so a reload doesn't wipe it. |
 
 Three forwarding guarantees, enforced in `EDO_FORWARD`:
 
