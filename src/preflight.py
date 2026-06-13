@@ -389,6 +389,52 @@ def check_docker_subnet_clear() -> Check:
         )
 
 
+def check_wg_port_accepted(port: int = 51820) -> Check:
+    """Verify the WireGuard handshake port is reachable on INPUT.
+
+    This is the single most common reason a fresh deployment "looks right"
+    but never sees a handshake: firewalld (or ufw, or a default-deny INPUT
+    policy) silently drops the UDP handshake before it reaches ``wg0``.
+    """
+    try:
+        from src.network import firewalld_active, wg_port_accepted
+    except ImportError as e:
+        return Check(
+            f"wg port {port}/udp accepted",
+            False,
+            Severity.WARNING,
+            detail=f"could not import network helpers: {e}",
+        )
+    if wg_port_accepted(port):
+        return Check(
+            f"wg port {port}/udp accepted",
+            True,
+            Severity.INFO,
+            detail="firewalld port-list or EDO_INPUT chain",
+        )
+    if firewalld_active():
+        return Check(
+            f"wg port {port}/udp accepted",
+            False,
+            Severity.WARNING,
+            detail="firewalld is active but this port is not in its open-ports list",
+            hint=(
+                f"`edo init` will open it automatically. To do it manually now: "
+                f"sudo firewall-cmd --add-port={port}/udp --permanent && sudo firewall-cmd --reload"
+            ),
+        )
+    return Check(
+        f"wg port {port}/udp accepted",
+        False,
+        Severity.WARNING,
+        detail="no edo INPUT rule and firewalld is not running",
+        hint=(
+            "if your host has a default-deny INPUT policy or runs another firewall, "
+            f"open {port}/udp manually or rerun `edo init` to install edo's EDO_INPUT rule"
+        ),
+    )
+
+
 def check_wg_interface_state(interface: str = "wg0") -> Check:
     if not shutil.which("ip"):
         return Check(
@@ -451,6 +497,7 @@ def run_all_checks(include_runtime: bool = True) -> PreflightReport:
         report.checks.append(check_docker_subnet_clear())
         report.checks.append(check_wg_interface_state())
         report.checks.append(check_port_free(51820, "udp"))
+        report.checks.append(check_wg_port_accepted(51820))
 
     return report
 
@@ -468,6 +515,11 @@ def quick_checks_for(command: str) -> PreflightReport:
         for b in ("wg", "wg-quick", "iptables", "ip"):
             report.checks.append(check_binary(b))
         report.checks.append(check_kernel_module("wireguard"))
+
+    if command == "add-peer":
+        # Most common silent failure mode for add-peer: port isn't open,
+        # so the new client config will never handshake. Flag it early.
+        report.checks.append(check_wg_port_accepted(51820))
 
     if command in {"init", "summon"}:
         report.checks.append(check_python_pkg("docker"))

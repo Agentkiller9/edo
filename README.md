@@ -155,8 +155,15 @@ Global flags:
                    challenge containers
 ```
 
-Three guarantees, enforced from a dedicated `EDO_FORWARD` chain hooked at
-position 1 of `FORWARD`:
+edo installs rules in **two dedicated iptables chains**, each hooked at
+position 1 of its parent so policy elsewhere is never disturbed:
+
+| Chain | Hooked into | Purpose |
+| --- | --- | --- |
+| `EDO_FORWARD` | `FORWARD` | The three forwarding guarantees below. |
+| `EDO_INPUT`   | `INPUT`   | Accept the WireGuard handshake on `udp/51820`. Installed only when firewalld is *not* the active firewall — when firewalld is active, `edo init` runs `firewall-cmd --add-port=51820/udp --permanent` instead so a reload doesn't wipe it. |
+
+Three forwarding guarantees, enforced in `EDO_FORWARD`:
 
 1. **Client isolation.** Any packet whose source _and_ destination are inside
    `10.8.0.0/24` is `DROP`ped.
@@ -239,7 +246,8 @@ What it checks:
 | docker | daemon reachable via `ping()` |
 | docker | `10.9.0.0/24` not already owned by another bridge |
 | wg0 | interface state |
-| port | `51820/udp` available |
+| port | `51820/udp` available (host can bind) |
+| firewall | `51820/udp` accepted by firewalld or `EDO_INPUT` |
 
 Specific failure modes worth knowing:
 

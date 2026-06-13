@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import shutil
 import subprocess
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -37,6 +38,7 @@ WG_SERVER_IP = "10.8.0.1"
 DOCKER_GATEWAY_IP = "10.9.0.1"
 
 EDO_CHAIN = "EDO_FORWARD"
+EDO_INPUT_CHAIN = "EDO_INPUT"
 
 
 @dataclass
@@ -93,9 +95,12 @@ def get_public_interface() -> Optional[str]:
 # ---- iptables primitives ------------------------------------------------
 def _iptables_check(rule: List[str]) -> bool:
     """``iptables -C`` returns 0 if the rule exists, non-zero otherwise."""
-    proc = subprocess.run(
-        ["iptables", "-C", *rule], capture_output=True, text=True
-    )
+    try:
+        proc = subprocess.run(
+            ["iptables", "-C", *rule], capture_output=True, text=True
+        )
+    except OSError:
+        return False
     return proc.returncode == 0
 
 
@@ -125,10 +130,155 @@ def _iptables_delete(rule: List[str]) -> RuleResult:
 
 
 def _chain_exists(chain: str) -> bool:
-    proc = subprocess.run(
-        ["iptables", "-L", chain, "-n"], capture_output=True, text=True
-    )
+    try:
+        proc = subprocess.run(
+            ["iptables", "-L", chain, "-n"], capture_output=True, text=True
+        )
+    except OSError:
+        # iptables binary missing entirely — caller treats this as "no chain".
+        return False
     return proc.returncode == 0
+
+
+# ---- firewalld interop --------------------------------------------------
+def firewalld_active() -> bool:
+    """Return True when firewalld is installed *and* the daemon is running.
+
+    RHEL/AlmaLinux/Rocky default to firewalld. When it's active, raw
+    iptables additions still appear in the chains but firewalld rewrites
+    the ruleset on reload and silently undoes them — so we delegate the
+    port opening to ``firewall-cmd`` instead.
+    """
+    if not shutil.which("firewall-cmd"):
+        return False
+    try:
+        proc = subprocess.run(
+            ["firewall-cmd", "--state"], capture_output=True, text=True
+        )
+    except OSError:
+        return False
+    return proc.returncode == 0 and "running" in proc.stdout.lower()
+
+
+def _firewalld_port_listed(port: int, proto: str = "udp") -> bool:
+    try:
+        proc = subprocess.run(
+            ["firewall-cmd", "--list-ports"], capture_output=True, text=True
+        )
+    except OSError:
+        return False
+    return proc.returncode == 0 and f"{port}/{proto}" in proc.stdout
+
+
+def wg_port_accepted(port: int = 51820, proto: str = "udp") -> bool:
+    """Best-effort: is the WG handshake port currently accepted on INPUT?
+
+    Used by the doctor preflight. Returns True if either firewalld lists
+    the port or edo's INPUT chain has a matching ACCEPT.
+    """
+    if firewalld_active() and _firewalld_port_listed(port, proto):
+        return True
+    if _chain_exists(EDO_INPUT_CHAIN):
+        try:
+            proc = subprocess.run(
+                ["iptables", "-L", EDO_INPUT_CHAIN, "-n"],
+                capture_output=True,
+                text=True,
+            )
+        except OSError:
+            return False
+        if proc.returncode == 0 and f"dpt:{port}" in proc.stdout:
+            return True
+    return False
+
+
+def apply_wg_input_rule(port: int = 51820) -> RuleResult:
+    """Open the WireGuard listener port on the host's INPUT plane.
+
+    Routes through firewalld when active so a future reload doesn't wipe
+    the rule; otherwise installs a dedicated ``EDO_INPUT`` chain hooked at
+    the top of INPUT.
+    """
+    if firewalld_active():
+        try:
+            _run(["firewall-cmd", f"--add-port={port}/udp", "--permanent"])
+            _run(["firewall-cmd", "--reload"])
+            logger.info("firewalld: opened %d/udp permanently", port)
+            return RuleResult(
+                success=True, rule=["firewalld", f"{port}/udp"]
+            )
+        except subprocess.CalledProcessError as e:
+            msg = (e.stderr or "").strip() or str(e)
+            return RuleResult(
+                success=False, rule=["firewalld", f"{port}/udp"], stderr=msg
+            )
+
+    # No firewalld — manage our own INPUT chain.
+    subprocess.run(
+        ["iptables", "-N", EDO_INPUT_CHAIN], capture_output=True, text=True
+    )
+    hook = ["INPUT", "-j", EDO_INPUT_CHAIN]
+    if not _iptables_check(hook):
+        try:
+            _run(["iptables", "-I", "INPUT", "1", "-j", EDO_INPUT_CHAIN])
+        except subprocess.CalledProcessError as e:
+            return RuleResult(
+                success=False,
+                rule=hook,
+                stderr=(e.stderr or "").strip(),
+            )
+
+    try:
+        _run(["iptables", "-F", EDO_INPUT_CHAIN])
+    except subprocess.CalledProcessError as e:
+        return RuleResult(
+            success=False,
+            rule=["-F", EDO_INPUT_CHAIN],
+            stderr=(e.stderr or "").strip(),
+        )
+
+    rule = [
+        EDO_INPUT_CHAIN,
+        "-p", "udp",
+        "--dport", str(port),
+        "-m", "comment", "--comment", "edo: WireGuard handshake",
+        "-j", "ACCEPT",
+    ]
+    return _iptables_append(rule)
+
+
+def remove_wg_input_rule(port: int = 51820) -> RuleResult:
+    """Inverse of :func:`apply_wg_input_rule`. Idempotent."""
+    if firewalld_active():
+        try:
+            _run(
+                ["firewall-cmd", f"--remove-port={port}/udp", "--permanent"]
+            )
+            _run(["firewall-cmd", "--reload"])
+            return RuleResult(
+                success=True, rule=["firewalld", f"{port}/udp"]
+            )
+        except subprocess.CalledProcessError as e:
+            return RuleResult(
+                success=False,
+                rule=["firewalld", f"{port}/udp"],
+                stderr=(e.stderr or "").strip(),
+            )
+
+    hook = ["INPUT", "-j", EDO_INPUT_CHAIN]
+    if _iptables_check(hook):
+        _iptables_delete(hook)
+    if _chain_exists(EDO_INPUT_CHAIN):
+        try:
+            _run(["iptables", "-F", EDO_INPUT_CHAIN])
+            _run(["iptables", "-X", EDO_INPUT_CHAIN])
+        except subprocess.CalledProcessError as e:
+            return RuleResult(
+                success=False,
+                rule=["-X", EDO_INPUT_CHAIN],
+                stderr=(e.stderr or "").strip(),
+            )
+    return RuleResult(success=True, rule=[EDO_INPUT_CHAIN, "removed"])
 
 
 # ---- rule set -----------------------------------------------------------
@@ -156,8 +306,13 @@ def _build_chain_rules(public_iface: str) -> List[List[str]]:
 
 
 # ---- public API ---------------------------------------------------------
-def apply_firewall() -> FirewallApplyResult:
+def apply_firewall(wg_port: int = 51820) -> FirewallApplyResult:
     """Idempotently install all edo firewall rules.
+
+    Adds the FORWARD rules **and** opens UDP ``wg_port`` on the host's
+    INPUT plane so the WireGuard handshake can actually reach the
+    listener — historically this was assumed and bit users on RHEL-family
+    hosts where firewalld blocks everything by default.
 
     Raises ``RuntimeError`` if any rule fails to install; partially-applied
     rules are flushed before raising so the host is left in a clean state.
@@ -214,6 +369,19 @@ def apply_firewall() -> FirewallApplyResult:
             raise RuntimeError(
                 f"failed to install rule {rule}: {res.stderr}"
             )
+    # Finally, open the WireGuard handshake port on INPUT. We do this last
+    # so a failure here doesn't leave FORWARD half-applied.
+    input_result = apply_wg_input_rule(wg_port)
+    result.rules.append(input_result)
+    if not input_result.success:
+        logger.error(
+            "could not open %d/udp for WireGuard: %s",
+            wg_port,
+            input_result.stderr,
+        )
+        # Don't roll back FORWARD — operators may want to fix the port
+        # opening manually rather than re-install everything.
+
     logger.info(
         "firewall applied (public iface=%s, %d rules)",
         public_iface,
@@ -222,8 +390,8 @@ def apply_firewall() -> FirewallApplyResult:
     return result
 
 
-def remove_firewall() -> List[RuleResult]:
-    """Unhook, flush, and delete the edo chain. Idempotent."""
+def remove_firewall(wg_port: int = 51820) -> List[RuleResult]:
+    """Unhook, flush, and delete the edo chains. Idempotent."""
     results: List[RuleResult] = []
     hook = ["FORWARD", "-j", EDO_CHAIN]
     if _iptables_check(hook):
@@ -256,6 +424,9 @@ def remove_firewall() -> List[RuleResult]:
                     stderr=(e.stderr or "").strip(),
                 )
             )
+    # Also drop the WG input rule we installed.
+    results.append(remove_wg_input_rule(wg_port))
+
     logger.info("firewall removed (%d ops)", len(results))
     return results
 

@@ -165,11 +165,13 @@ def cmd_init(args: argparse.Namespace, db: DatabaseManager) -> int:
     server = wireguard.init_server(endpoint=endpoint, port=port)
 
     _print("[*] Applying firewall sealing tags...")
-    fw = network.apply_firewall()
+    fw = network.apply_firewall(wg_port=port)
     _print(
         f"[+] Firewall applied on {fw.public_interface} ({len(fw.rules)} rules).",
         style="green",
     )
+    if network.firewalld_active():
+        _print(f"    firewalld: opened {port}/udp (permanent)", style="dim")
 
     _print("[*] Ensuring docker bridge exists...")
     docker_mgr.ensure_network()
@@ -361,7 +363,7 @@ def cmd_teardown(args: argparse.Namespace, db: DatabaseManager) -> int:
     _print("[*] Removing docker bridge...")
     docker_mgr.remove_network()
     _print("[*] Lifting firewall rules...")
-    network.remove_firewall()
+    network.remove_firewall(wg_port=wireguard.WG_LISTEN_PORT)
     _print(f"[*] Bringing {network.WG_INTERFACE} down...")
     wireguard.bring_down()
     _print("[+] Sealing tag lifted. Reanimation released.", style="green")
