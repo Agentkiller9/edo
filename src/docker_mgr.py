@@ -77,11 +77,88 @@ COMPOSE_FILES = (
 
 
 @dataclass
+class SecurityProfile:
+    """Container-level security and resource controls.
+
+    Defaults are conservative: ``no-new-privileges`` blocks setuid
+    escalation paths from inside the container, and ``NET_RAW`` is dropped
+    so a compromised container can't sniff or spoof packets on the docker
+    bridge (a real lateral-movement vector when multiple challenges share
+    edo_br0). Everything else mirrors Docker's defaults so we don't break
+    existing challenges.
+
+    All resource limits are opt-in. Operators tune them per challenge via
+    ``edo summon --memory 512m --cpus 1 --pids-limit 100``.
+    """
+
+    no_new_privileges: bool = True
+    cap_drop: List[str] = field(default_factory=lambda: ["NET_RAW"])
+    cap_add: List[str] = field(default_factory=list)
+    read_only_rootfs: bool = False
+    memory: Optional[str] = None       # e.g. "512m", "1g"
+    cpus: Optional[float] = None        # e.g. 0.5, 1.0
+    pids_limit: Optional[int] = None
+    restart_policy: str = "unless-stopped"
+
+    def summary(self) -> str:
+        """One-line human summary suitable for logging after deploy."""
+        bits: List[str] = []
+        if self.no_new_privileges:
+            bits.append("no-new-privs")
+        if self.cap_drop:
+            bits.append(f"cap-drop={'+'.join(self.cap_drop)}")
+        if self.cap_add:
+            bits.append(f"cap-add={'+'.join(self.cap_add)}")
+        if self.read_only_rootfs:
+            bits.append("read-only")
+        if self.memory:
+            bits.append(f"mem={self.memory}")
+        if self.cpus is not None:
+            bits.append(f"cpus={self.cpus}")
+        if self.pids_limit is not None:
+            bits.append(f"pids={self.pids_limit}")
+        bits.append(f"restart={self.restart_policy}")
+        return " ".join(bits)
+
+
+def _build_secure_host_config(client: "docker.DockerClient", profile: SecurityProfile) -> dict:
+    """Translate a :class:`SecurityProfile` into a Docker host_config dict."""
+    kwargs: dict = {"restart_policy": {"Name": profile.restart_policy}}
+
+    security_opt: List[str] = []
+    if profile.no_new_privileges:
+        security_opt.append("no-new-privileges:true")
+    if security_opt:
+        kwargs["security_opt"] = security_opt
+
+    if profile.cap_drop:
+        kwargs["cap_drop"] = list(profile.cap_drop)
+    if profile.cap_add:
+        kwargs["cap_add"] = list(profile.cap_add)
+
+    if profile.memory:
+        kwargs["mem_limit"] = profile.memory
+    if profile.cpus is not None:
+        kwargs["nano_cpus"] = int(profile.cpus * 1_000_000_000)
+    if profile.pids_limit is not None:
+        kwargs["pids_limit"] = profile.pids_limit
+    if profile.read_only_rootfs:
+        kwargs["read_only"] = True
+        # Most challenges need *somewhere* writable; /tmp tmpfs is the
+        # least-surprising default. Operators who want a fully sealed
+        # rootfs can omit /tmp from their Dockerfile usage.
+        kwargs["tmpfs"] = {"/tmp": "rw,size=64m,exec"}
+
+    return client.api.create_host_config(**kwargs)
+
+
+@dataclass
 class DeployResult:
     success: bool
     containers: List[Container] = field(default_factory=list)
     error: Optional[str] = None
     image_tag: Optional[str] = None
+    security_summary: Optional[str] = None
 
 
 # ---- helpers ------------------------------------------------------------
@@ -271,11 +348,15 @@ def find_next_container_ip(db: DatabaseManager, also_used: List[str]) -> str:
 
 # ---- Dockerfile deployment ---------------------------------------------
 def deploy_dockerfile(
-    db: DatabaseManager, challenge_name: str, path: Path
+    db: DatabaseManager,
+    challenge_name: str,
+    path: Path,
+    security: Optional[SecurityProfile] = None,
 ) -> DeployResult:
     if not (path / "Dockerfile").is_file():
         return DeployResult(success=False, error=f"no Dockerfile in {path}")
 
+    profile = security or SecurityProfile()
     ensure_network()
     client = _client()
     image_tag = f"edo/{_normalize_project_name(challenge_name).removeprefix('edo_')}:latest"
@@ -297,15 +378,17 @@ def deploy_dockerfile(
         networking_cfg = client.api.create_networking_config(
             {DOCKER_BRIDGE: endpoint_cfg}
         )
-        host_cfg = client.api.create_host_config(
-            restart_policy={"Name": "unless-stopped"}
-        )
+        host_cfg = _build_secure_host_config(client, profile)
         created = client.api.create_container(
             image=image_tag,
             name=_normalize_project_name(challenge_name),
             networking_config=networking_cfg,
             host_config=host_cfg,
-            labels={"edo.challenge": challenge_name, "edo.managed": "true"},
+            labels={
+                "edo.challenge": challenge_name,
+                "edo.managed": "true",
+                "edo.security": profile.summary(),
+            },
         )
         client.api.start(created["Id"])
         container = client.containers.get(created["Id"])
@@ -334,10 +417,17 @@ def deploy_dockerfile(
         )
 
     logger.info(
-        "deployed %s as %s @ %s", challenge_name, container.short_id, assigned_ip
+        "deployed %s as %s @ %s [%s]",
+        challenge_name,
+        container.short_id,
+        assigned_ip,
+        profile.summary(),
     )
     return DeployResult(
-        success=True, containers=[record], image_tag=image_tag
+        success=True,
+        containers=[record],
+        image_tag=image_tag,
+        security_summary=profile.summary(),
     )
 
 
@@ -360,7 +450,10 @@ def _cleanup_partial(
 
 # ---- compose deployment ------------------------------------------------
 def deploy_compose(
-    db: DatabaseManager, challenge_name: str, path: Path
+    db: DatabaseManager,
+    challenge_name: str,
+    path: Path,
+    security: Optional[SecurityProfile] = None,
 ) -> DeployResult:
     compose_file = next(
         (path / cf for cf in COMPOSE_FILES if (path / cf).is_file()), None
@@ -368,6 +461,16 @@ def deploy_compose(
     if compose_file is None:
         return DeployResult(
             success=False, error=f"no compose file found in {path}"
+        )
+
+    # Compose files own their service spec — Docker won't let us inject
+    # security_opt / cap_drop / resource limits after the fact. Warn so the
+    # operator can move the constraints into the compose YAML instead.
+    if security is not None and security != SecurityProfile():
+        logger.warning(
+            "compose deployment ignores edo hardening flags; declare "
+            "security_opt / cap_drop / mem_limit / cpus in %s instead",
+            compose_file.name,
         )
     if shutil.which("docker") is None:
         return DeployResult(success=False, error="docker CLI not on PATH")

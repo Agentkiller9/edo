@@ -302,13 +302,16 @@ def cmd_summon(args: argparse.Namespace, db: DatabaseManager) -> int:
         return 2
 
     name = getattr(args, "name", None) or path.name
+    profile = _build_security_profile(args)
     _print(f"[*] Detected layout: {layout}. Summoning '{name}'...")
 
     if layout == "compose":
-        result = docker_mgr.deploy_compose(db, challenge_name=name, path=path)
+        result = docker_mgr.deploy_compose(
+            db, challenge_name=name, path=path, security=profile
+        )
     else:
         result = docker_mgr.deploy_dockerfile(
-            db, challenge_name=name, path=path
+            db, challenge_name=name, path=path, security=profile
         )
 
     if not result.success:
@@ -320,7 +323,26 @@ def cmd_summon(args: argparse.Namespace, db: DatabaseManager) -> int:
             f"[+] {c.challenge_name}  ->  {c.container_id[:12]}  @ {c.assigned_ip}",
             style="green",
         )
+    if result.security_summary:
+        _print(f"    hardening: {result.security_summary}", style="dim")
     return 0
+
+
+def _build_security_profile(args: argparse.Namespace) -> docker_mgr.SecurityProfile:
+    """Translate ``summon`` CLI flags into a :class:`SecurityProfile`."""
+    extra_drops = list(getattr(args, "cap_drop", None) or [])
+    # NET_RAW is always dropped; if the operator passed it again, dedupe.
+    cap_drop = ["NET_RAW"] + [c for c in extra_drops if c.upper() != "NET_RAW"]
+    return docker_mgr.SecurityProfile(
+        no_new_privileges=not getattr(args, "allow_setuid", False),
+        cap_drop=cap_drop,
+        cap_add=list(getattr(args, "cap_add", None) or []),
+        read_only_rootfs=bool(getattr(args, "read_only", False)),
+        memory=getattr(args, "memory", None),
+        cpus=getattr(args, "cpus", None),
+        pids_limit=getattr(args, "pids_limit", None),
+        restart_policy=getattr(args, "restart", None) or "unless-stopped",
+    )
 
 
 def cmd_release(args: argparse.Namespace, db: DatabaseManager) -> int:
@@ -654,6 +676,51 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_sum.add_argument("path", nargs="?")
     p_sum.add_argument("--name", help="Override challenge name")
+    # ---- container hardening (Dockerfile path only; compose path warns) ----
+    p_sum.add_argument(
+        "--memory",
+        help="Memory cap (e.g. 512m, 1g). Default: no limit.",
+    )
+    p_sum.add_argument(
+        "--cpus",
+        type=float,
+        help="CPU cap (e.g. 0.5, 1, 2). Default: no limit.",
+    )
+    p_sum.add_argument(
+        "--pids-limit",
+        type=int,
+        help="Max processes the container may spawn. Default: no limit.",
+    )
+    p_sum.add_argument(
+        "--read-only",
+        action="store_true",
+        help="Mount the rootfs read-only with a tmpfs /tmp.",
+    )
+    p_sum.add_argument(
+        "--cap-add",
+        action="append",
+        default=[],
+        metavar="CAP",
+        help="Add a Linux capability (repeatable). Example: --cap-add SYS_PTRACE",
+    )
+    p_sum.add_argument(
+        "--cap-drop",
+        action="append",
+        default=[],
+        metavar="CAP",
+        help="Drop an additional capability (repeatable). NET_RAW is always dropped.",
+    )
+    p_sum.add_argument(
+        "--allow-setuid",
+        action="store_true",
+        help="Disable no-new-privileges. Only do this if a challenge intentionally needs setuid.",
+    )
+    p_sum.add_argument(
+        "--restart",
+        choices=("no", "on-failure", "unless-stopped", "always"),
+        default="unless-stopped",
+        help="Container restart policy. Default: unless-stopped.",
+    )
 
     p_rel = sub.add_parser("release", help="Tear down a container")
     p_rel.add_argument("--container", help="Container ID")

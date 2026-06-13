@@ -178,6 +178,63 @@ unhooks and deletes only its own chain.
 
 ---
 
+## Container security model
+
+`edo` runs as host root (it has to — iptables, WireGuard, and the docker
+socket all require it), but **container root is not host root**. Linux
+namespaces (mount, pid, net, ipc) isolate each container's "uid 0" from
+the host. Participants who pwn a service and get an in-container shell
+have what amounts to a normal unprivileged process on the host, under
+`dockerd`'s cgroup.
+
+Default hardening every `summon` applies to a Dockerfile deployment:
+
+| Setting | Why |
+| --- | --- |
+| `--security-opt no-new-privileges:true` | Blocks setuid-based privilege escalation from inside the container. |
+| `--cap-drop NET_RAW` | Without `NET_RAW`, a compromised container can't sniff or spoof packets on `edo_br0`. Real lateral-movement protection between challenges. |
+| Default Docker capability set (minus the above) | Doesn't break challenges that legitimately need `SETUID`, `CHOWN`, `KILL`, etc. |
+| Default seccomp profile, no `--privileged`, no `docker.sock` mount, no host-path mounts, no shared namespaces | These are the *common* container-escape vectors. `edo` doesn't use any of them. |
+| Restart policy `unless-stopped` | A crashed container comes back. Override with `--restart no` if you want pwned containers to stay dead so you can inspect them. |
+
+Optional hardening flags on `edo summon`:
+
+| Flag | What it does |
+| --- | --- |
+| `--memory 512m` | Hard memory cap. A team's fork bomb stays a team's problem. |
+| `--cpus 1.0` | CPU cap. |
+| `--pids-limit 100` | Max processes inside the container. The real fork-bomb defense. |
+| `--read-only` | Rootfs is read-only; `/tmp` is a 64 MB tmpfs. Most CTF web challenges work unchanged. |
+| `--cap-add CAP` / `--cap-drop CAP` | Repeatable. Tune capabilities per challenge. `NET_RAW` is always dropped regardless. |
+| `--allow-setuid` | Disable `no-new-privileges`. Only use if a challenge intentionally relies on setuid bits. |
+| `--restart {no\|on-failure\|unless-stopped\|always}` | Restart policy. |
+
+Recommended baseline for a typical web challenge:
+
+```bash
+sudo python3 edo.py summon /path/to/challenge \
+  --memory 512m --cpus 1 --pids-limit 100 --read-only
+```
+
+A "hardening" line shows after deploy so you see what's active:
+
+```
+[+] sqli-01  ->  abc123def456  @ 10.9.0.5
+    hardening: no-new-privs cap-drop=NET_RAW read-only mem=512m cpus=1 pids=100 restart=unless-stopped
+```
+
+**Compose deployments don't get these flags** — `docker compose` owns the
+service spec, so we'd have to merge into the YAML at runtime. `edo` emits
+a warning if you pass hardening flags with a compose challenge, telling
+you to declare the equivalent `security_opt:` / `cap_drop:` /
+`mem_limit:` / `cpus:` keys in the compose file itself.
+
+What edo *doesn't* protect against and probably never will:
+
+- **Kernel CVEs.** Containers share the host kernel. Keep your host patched.
+- **runc / containerd CVEs.** Keep Docker patched.
+- **Intentionally vulnerable challenges that mount sensitive paths in their own Dockerfile.** Review challenge Dockerfiles before deploying — `edo` builds and runs whatever you point it at.
+
 ## Layout on disk
 
 | Path | What lives there |
