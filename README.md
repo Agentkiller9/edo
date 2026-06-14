@@ -83,7 +83,8 @@ Hand `alice.conf` to the participant → they import it into the WireGuard app �
 #### 💀 Reanimation — challenges
 | Command | Does |
 | --- | --- |
-| `edo summon PATH [--name N]` | Build + run a `Dockerfile`/`compose` challenge on the bridge. |
+| `edo summon PATH [--name N]` | Build + run a `Dockerfile`/`compose` challenge on the bridge. If the name is already deployed, edo offers to replace it (interactive) or needs `--replace` (scripted). |
+| `edo summon PATH --replace` | Remove the existing container + image for this name, then redeploy clean. |
 | `edo release --container ID` | Release one container. |
 | `edo release --all` | Release every reanimated challenge. |
 

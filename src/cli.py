@@ -539,6 +539,29 @@ def cmd_summon(args: argparse.Namespace, db: DatabaseManager) -> int:
         name = _ask("Challenge name", default=default_name) or default_name
     if not name:
         name = default_name
+    # If something is already deployed under this name, offer to replace it
+    # rather than crashing on a Docker name conflict.
+    existing = docker_mgr.find_existing(name)
+    if existing.exists:
+        _print(f"[!] '{name}' is already deployed:", style="yellow")
+        for line in existing.describe():
+            _print(f"      - {line}")
+        do_replace = getattr(args, "replace", False)
+        if not do_replace and interactive:
+            do_replace = _confirm(
+                "Remove the old container + image and redeploy?", default=True
+            )
+        if not do_replace:
+            _print(
+                "[!] Aborted. Re-run with --replace to overwrite, or "
+                "`edo release` the old container first.",
+                style="bold red",
+            )
+            return 1
+        removed = docker_mgr.remove_existing(db, name)
+        for r in removed:
+            _print(f"[*] removed {r}", style="dim")
+
     profile = _build_security_profile(args)
     if interactive and layout == "dockerfile":
         # Surface the hardening menu only for the Dockerfile path —
@@ -1131,6 +1154,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_sum.add_argument("path", nargs="?")
     p_sum.add_argument("--name", help="Override challenge name")
+    p_sum.add_argument(
+        "--replace",
+        action="store_true",
+        help="If a deployment with this name exists, remove its container + image first.",
+    )
     # ---- container hardening (Dockerfile path only; compose path warns) ----
     p_sum.add_argument(
         "--memory",

@@ -235,6 +235,113 @@ def _normalize_project_name(name: str) -> str:
     return "edo_" + re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
 
 
+def container_name_for(challenge_name: str) -> str:
+    """The container / compose-project name edo uses for a challenge."""
+    return _normalize_project_name(challenge_name)
+
+
+def image_tag_for(challenge_name: str) -> str:
+    """The image tag edo builds for a Dockerfile challenge."""
+    return f"edo/{_normalize_project_name(challenge_name).removeprefix('edo_')}:latest"
+
+
+@dataclass
+class ExistingDeployment:
+    """What's already on the host for a given challenge name."""
+
+    containers: List[Tuple[str, str, str]] = field(default_factory=list)  # (id, name, status)
+    image_tag: Optional[str] = None
+    image_id: Optional[str] = None
+
+    @property
+    def exists(self) -> bool:
+        return bool(self.containers) or self.image_id is not None
+
+    def describe(self) -> List[str]:
+        lines = [
+            f"container '{name}' ({cid[:12]}, {status})"
+            for cid, name, status in self.containers
+        ]
+        if self.image_tag:
+            lines.append(f"image '{self.image_tag}'")
+        return lines
+
+
+def find_existing(challenge_name: str) -> ExistingDeployment:
+    """Find any container/image already deployed under this challenge name.
+
+    Covers both layouts: the Dockerfile container is matched by its exact
+    name, compose services by the ``com.docker.compose.project`` label, and
+    the edo-built image by its tag. Used by ``summon`` to offer a clean
+    replace instead of failing with a Docker 409 name conflict.
+    """
+    client = _client()
+    ed = ExistingDeployment()
+    cname = container_name_for(challenge_name)
+    seen: set = set()
+
+    try:
+        c = client.containers.get(cname)
+        ed.containers.append((c.id, c.name, c.status))
+        seen.add(c.id)
+    except (NotFound, APIError):
+        pass
+
+    try:
+        for c in client.containers.list(
+            all=True,
+            filters={"label": f"com.docker.compose.project={cname}"},
+        ):
+            if c.id not in seen:
+                ed.containers.append((c.id, c.name, c.status))
+                seen.add(c.id)
+    except APIError as e:
+        logger.debug("compose-project lookup failed: %s", e)
+
+    tag = image_tag_for(challenge_name)
+    try:
+        img = client.images.get(tag)
+        ed.image_tag, ed.image_id = tag, img.id
+    except (ImageNotFound, NotFound, APIError):
+        pass
+
+    return ed
+
+
+def remove_existing(db: DatabaseManager, challenge_name: str) -> List[str]:
+    """Force-remove the container(s) + edo image + DB rows for a challenge.
+
+    Returns a list of human-readable things removed, for reporting. Safe to
+    call when nothing exists (returns an empty list). Works for both layouts
+    — force-removing the service containers is enough for a clean redeploy;
+    ``deploy_compose`` recreates them with ``up --build``.
+    """
+    client = _client()
+    removed: List[str] = []
+    ed = find_existing(challenge_name)
+
+    for cid, name, _status in ed.containers:
+        try:
+            client.containers.get(cid).remove(force=True)
+            removed.append(f"container '{name}'")
+        except (NotFound, APIError) as e:
+            logger.warning("could not remove container %s: %s", name, e)
+        # Clear the DB row regardless of whether the container was still there.
+        if db.remove_container(cid):
+            logger.debug("cleared DB record for %s", cid[:12])
+
+    if ed.image_tag:
+        try:
+            client.images.remove(ed.image_tag, force=True)
+            removed.append(f"image '{ed.image_tag}'")
+        except (ImageNotFound, NotFound) as e:
+            logger.debug("image %s already gone: %s", ed.image_tag, e)
+        except APIError as e:
+            logger.warning("could not remove image %s: %s", ed.image_tag, e)
+
+    return removed
+
+
 def detect_layout(path: Path) -> Optional[str]:
     """Return ``"compose"``, ``"dockerfile"``, or ``None``."""
     for cf in COMPOSE_FILES:
@@ -444,7 +551,7 @@ def deploy_dockerfile(
     profile = security or SecurityProfile()
     ensure_network()
     client = _client()
-    image_tag = f"edo/{_normalize_project_name(challenge_name).removeprefix('edo_')}:latest"
+    image_tag = image_tag_for(challenge_name)
 
     # ---- build (streams full BuildKit output to the terminal) ----
     ok, build_error = build_image(image_tag, path)
@@ -472,7 +579,7 @@ def deploy_dockerfile(
             )
             created = client.api.create_container(
                 image=image_tag,
-                name=_normalize_project_name(challenge_name),
+                name=container_name_for(challenge_name),
                 networking_config=networking_cfg,
                 host_config=host_cfg,
                 labels={
@@ -489,7 +596,7 @@ def deploy_dockerfile(
             # Clean up a half-created container before retrying.
             try:
                 client.containers.get(
-                    _normalize_project_name(challenge_name)
+                    container_name_for(challenge_name)
                 ).remove(force=True)
             except (APIError, NotFound):
                 pass
