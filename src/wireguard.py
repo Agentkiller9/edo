@@ -123,6 +123,30 @@ def _derive_pubkey(private_key: str) -> str:
         ) from e
 
 
+# Placeholder written into a client config when the participant supplied
+# only their public key. They replace this line with their own private key
+# locally — the server never sees it.
+CLIENT_KEY_PLACEHOLDER = "<PASTE_YOUR_PRIVATE_KEY_HERE>"
+
+
+def is_valid_wg_key(key: str) -> bool:
+    """Structural check for a WireGuard base64 key.
+
+    WG keys are 32 raw bytes → 44 base64 chars ending in ``=``. This
+    catches typos and truncation; it does not verify the key is on the
+    curve (wg itself will reject a malformed key when we apply it).
+    """
+    import base64
+
+    key = key.strip()
+    if len(key) != 44 or not key.endswith("="):
+        return False
+    try:
+        return len(base64.b64decode(key, validate=True)) == 32
+    except (ValueError, Exception):
+        return False
+
+
 # ---- IP allocation ------------------------------------------------------
 def find_next_available_ip(db: DatabaseManager) -> str:
     """Return the next free address in the WireGuard subnet.
@@ -285,8 +309,22 @@ def add_peer(
     username: str,
     server: ServerConfig,
     clients_dir: Optional[Path] = None,
+    public_key: Optional[str] = None,
 ) -> ClientConfig:
     """Allocate, persist, write, and live-apply a new peer.
+
+    Two key-handling modes:
+
+    * **Server-side keys** (``public_key=None``, default): edo generates the
+      keypair and writes a ready-to-use client config containing the private
+      key. Convenient, but the server holds the private key (in the DB and in
+      the on-disk client config).
+
+    * **Client-side keys** (``public_key`` supplied): the participant
+      generated their own keypair and gave us only the public half. The
+      server stores ``private_key=NULL`` and the rendered client config
+      carries a placeholder the participant replaces locally. The private
+      key never touches the server — the stronger model for untrusted infra.
 
     ``clients_dir`` controls where the generated ``<username>.conf`` is
     written. Defaults to :data:`WG_CLIENTS_DIR`. The directory is created
@@ -297,13 +335,24 @@ def add_peer(
     if db.get_peer(username):
         raise ValueError(f"peer '{username}' already exists")
 
-    kp = generate_keypair()
+    if public_key is not None:
+        public_key = public_key.strip()
+        if not is_valid_wg_key(public_key):
+            raise ValueError(
+                f"'{public_key}' is not a valid WireGuard public key "
+                "(expected 44 base64 chars ending in '=')"
+            )
+        stored_public, stored_private = public_key, None
+    else:
+        kp = generate_keypair()
+        stored_public, stored_private = kp.public_key, kp.private_key
+
     ip = find_next_available_ip(db)
     peer = db.add_peer(
         username=username,
         ip_address=ip,
-        public_key=kp.public_key,
-        private_key=kp.private_key,
+        public_key=stored_public,
+        private_key=stored_private,
     )
 
     out_dir = Path(clients_dir) if clients_dir is not None else WG_CLIENTS_DIR
@@ -390,10 +439,22 @@ def _rewrite_server_config(
 
 
 def _render_client_config(peer: Peer, server: ServerConfig) -> str:
+    # In client-side-key mode peer.private_key is None; emit a placeholder
+    # the participant fills in locally, plus a reminder comment.
+    if peer.private_key:
+        priv_line = f"PrivateKey = {peer.private_key}\n"
+        note = ""
+    else:
+        priv_line = f"PrivateKey = {CLIENT_KEY_PLACEHOLDER}\n"
+        note = (
+            "# NOTE: replace the PrivateKey placeholder below with the private "
+            "key you generated locally.\n"
+        )
     return (
         "[Interface]\n"
         f"# edo: client config for {peer.username}\n"
-        f"PrivateKey = {peer.private_key}\n"
+        f"{note}"
+        f"{priv_line}"
         f"Address = {peer.ip_address}/32\n"
         "DNS = 1.1.1.1\n"
         "\n"

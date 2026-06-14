@@ -271,9 +271,26 @@ def cmd_add_peer(args: argparse.Namespace, db: DatabaseManager) -> int:
     server = wireguard.init_server(endpoint=endpoint, port=port)
     clients_dir = resolve_client_dir(args)
 
+    # Client-side key: --public-key on the CLI, or an interactive prompt
+    # offering the safer mode. Empty/blank → server generates the keypair.
+    public_key = getattr(args, "public_key", None)
+    if public_key is None and interactive:
+        _print(
+            "\n[*] Leave blank to let edo generate the keypair (server holds the\n"
+            "    private key). To use a key the participant generated themselves,\n"
+            "    paste their PUBLIC key here (server never sees their private key).",
+            style="dim",
+        )
+        entered = _ask("Participant public key (optional)", default="")
+        public_key = entered or None
+
     try:
         cc = wireguard.add_peer(
-            db, username=username, server=server, clients_dir=clients_dir
+            db,
+            username=username,
+            server=server,
+            clients_dir=clients_dir,
+            public_key=public_key,
         )
     except ValueError as e:
         _print(f"[!] {e}", style="bold red")
@@ -285,7 +302,112 @@ def cmd_add_peer(args: argparse.Namespace, db: DatabaseManager) -> int:
     _print(f"[+] Vessel '{username}' bound to the contract.", style="green")
     _print(f"    IP:     {cc.peer.ip_address}")
     _print(f"    Config: {cc.config_path}")
+    if cc.peer.private_key is None:
+        _print(
+            "    Key mode: client-side — config has a PrivateKey placeholder "
+            "for the participant to fill in.",
+            style="dim",
+        )
     return 0
+
+
+def cmd_add_peers(args: argparse.Namespace, db: DatabaseManager) -> int:
+    """Bulk-import peers from a CSV.
+
+    CSV columns (header optional): ``username`` and an optional
+    ``public_key``. A row with only a username gets a server-generated
+    keypair; a row with a public key uses client-side-key mode. One bad
+    row never aborts the batch — every row is attempted and a summary is
+    printed at the end.
+    """
+    if not gate_with_preflight("add-peer"):
+        return 1
+
+    csv_path_raw = getattr(args, "from_csv", None) or _ask(
+        "Path to CSV (columns: username[,public_key])"
+    )
+    if not csv_path_raw:
+        _print("[!] CSV path required", style="bold red")
+        return 2
+    csv_path = Path(csv_path_raw).expanduser()
+    if not csv_path.is_file():
+        _print(f"[!] no such file: {csv_path}", style="bold red")
+        return 2
+
+    interactive = getattr(args, "from_csv", None) is None
+    endpoint = resolve_endpoint(args)
+    if not endpoint:
+        _print("[!] endpoint required", style="bold red")
+        return 2
+    port = resolve_port(args, interactive)
+    server = wireguard.init_server(endpoint=endpoint, port=port)
+    clients_dir = resolve_client_dir(args)
+
+    rows = _read_peer_csv(csv_path)
+    if not rows:
+        _print(f"[!] no usable rows in {csv_path}", style="bold red")
+        return 2
+
+    added, skipped, failed = 0, 0, 0
+    for username, public_key in rows:
+        try:
+            cc = wireguard.add_peer(
+                db,
+                username=username,
+                server=server,
+                clients_dir=clients_dir,
+                public_key=public_key,
+            )
+            mode = "client-key" if cc.peer.private_key is None else "server-key"
+            _print(
+                f"[+] {username:20} {cc.peer.ip_address:10} ({mode})  {cc.config_path}",
+                style="green",
+            )
+            added += 1
+        except ValueError as e:
+            # Already-exists or bad key — expected, non-fatal.
+            msg = str(e)
+            if "already exists" in msg:
+                _print(f"[=] {username:20} skipped: already exists", style="yellow")
+                skipped += 1
+            else:
+                _print(f"[!] {username:20} failed: {msg}", style="bold red")
+                failed += 1
+        except Exception as e:
+            logger.debug("bulk add failed for %s", username, exc_info=True)
+            _print(f"[!] {username:20} failed: {e}", style="bold red")
+            failed += 1
+
+    _print(
+        f"\n[*] Done: {added} added, {skipped} skipped, {failed} failed "
+        f"({len(rows)} rows).",
+        style="bold green" if failed == 0 else "bold yellow",
+    )
+    return 0 if failed == 0 else 1
+
+
+def _read_peer_csv(path: Path) -> List[Tuple[str, Optional[str]]]:
+    """Parse a peer CSV into (username, public_key|None) tuples.
+
+    Tolerant of: an optional header row, a username-only single column,
+    blank lines, and surrounding whitespace. A header is detected by a
+    first cell of literally ``username`` (case-insensitive).
+    """
+    import csv as _csv
+
+    out: List[Tuple[str, Optional[str]]] = []
+    with path.open(newline="", encoding="utf-8") as f:
+        reader = _csv.reader(f)
+        for i, raw in enumerate(reader):
+            cells = [c.strip() for c in raw if c.strip() != ""]
+            if not cells:
+                continue
+            if i == 0 and cells[0].lower() == "username":
+                continue  # header
+            username = cells[0]
+            public_key = cells[1] if len(cells) > 1 else None
+            out.append((username, public_key))
+    return out
 
 
 def cmd_remove_peer(args: argparse.Namespace, db: DatabaseManager) -> int:
@@ -301,6 +423,84 @@ def cmd_remove_peer(args: argparse.Namespace, db: DatabaseManager) -> int:
         return 0
     _print(f"[!] No such peer: {username}", style="bold red")
     return 1
+
+
+def cmd_export(args: argparse.Namespace, db: DatabaseManager) -> int:
+    """Re-print or bundle generated client configs.
+
+    ``export <username>``        → print that peer's config to stdout
+    ``export <username> -o P``   → write a copy to path P
+    ``export --all -o peers.tgz``→ bundle every client config into a tarball
+    """
+    clients_dir = resolve_client_dir(args)
+    output = getattr(args, "output", None)
+    export_all = getattr(args, "all", False)
+    username = getattr(args, "username", None)
+
+    # Interactive: no flags given → ask what to export.
+    if not export_all and not username:
+        if _confirm("Export ALL peer configs as a tarball?", default=False):
+            export_all = True
+        else:
+            username = _ask("Username to export")
+
+    if export_all:
+        peers = db.get_all_peers()
+        if not peers:
+            _print("[!] no peers to export", style="bold red")
+            return 1
+        out_path = Path(output) if output else Path("edo-peers.tar.gz")
+        import tarfile
+
+        written = 0
+        with tarfile.open(out_path, "w:gz") as tar:
+            for p in peers:
+                conf = clients_dir / f"{p.username}.conf"
+                if conf.is_file():
+                    tar.add(conf, arcname=f"{p.username}.conf")
+                    written += 1
+                else:
+                    _print(
+                        f"[=] {p.username}: no config on disk at {conf} — skipped",
+                        style="yellow",
+                    )
+        _print(
+            f"[+] Bundled {written}/{len(peers)} config(s) → {out_path}",
+            style="green",
+        )
+        return 0 if written else 1
+
+    if not username:
+        _print("[!] username required (or --all)", style="bold red")
+        return 2
+
+    if not db.get_peer(username):
+        _print(f"[!] no such peer: {username}", style="bold red")
+        return 1
+
+    conf = clients_dir / f"{username}.conf"
+    if not conf.is_file():
+        _print(
+            f"[!] no config on disk for '{username}' at {conf}.\n"
+            "    It may have been generated with a different --client-dir, or "
+            "removed. Re-run add-peer to regenerate.",
+            style="bold red",
+        )
+        return 1
+
+    text = conf.read_text()
+    if output:
+        out_path = Path(output)
+        out_path.write_text(text)
+        try:
+            out_path.chmod(0o600)
+        except OSError:
+            pass
+        _print(f"[+] Wrote {username}'s config → {out_path}", style="green")
+    else:
+        # Raw stdout (no rich styling) so it pipes/copies cleanly.
+        print(text)
+    return 0
 
 
 def cmd_summon(args: argparse.Namespace, db: DatabaseManager) -> int:
@@ -828,11 +1028,13 @@ def interactive_menu(db: DatabaseManager, args: argparse.Namespace) -> int:
         "1": ("Show status footprint", cmd_status),
         "2": ("Summon a challenge (deploy)", cmd_summon),
         "3": ("Bind a new peer (add WireGuard client)", cmd_add_peer),
-        "4": ("Release a vessel (teardown container)", cmd_release),
-        "5": ("Initialise / re-apply infrastructure", cmd_init),
-        "6": ("Lift the seal (teardown everything)", cmd_teardown),
-        "7": ("Diagnose host (edo doctor)", cmd_doctor),
-        "8": ("Purge — deep cleanup of every edo artifact", cmd_purge),
+        "4": ("Bulk-import peers from CSV", cmd_add_peers),
+        "5": ("Export / bundle peer configs", cmd_export),
+        "6": ("Release a vessel (teardown container)", cmd_release),
+        "7": ("Initialise / re-apply infrastructure", cmd_init),
+        "8": ("Lift the seal (teardown everything)", cmd_teardown),
+        "9": ("Diagnose host (edo doctor)", cmd_doctor),
+        "10": ("Purge — deep cleanup of every edo artifact", cmd_purge),
         "q": ("Quit", None),
     }
 
@@ -890,9 +1092,39 @@ def build_parser() -> argparse.ArgumentParser:
     p_add.add_argument("username", nargs="?")
     p_add.add_argument("--endpoint", help="Public endpoint for clients")
     p_add.add_argument("--port", type=int, default=None)
+    p_add.add_argument(
+        "--public-key",
+        help=(
+            "Participant's WireGuard PUBLIC key. When given, the server never "
+            "holds their private key (client-side key mode). Omit to have edo "
+            "generate the keypair."
+        ),
+    )
+
+    p_addbulk = sub.add_parser(
+        "add-peers", help="Bulk-import participants from a CSV"
+    )
+    p_addbulk.add_argument(
+        "--from",
+        dest="from_csv",
+        help="CSV file with columns: username[,public_key]",
+    )
+    p_addbulk.add_argument("--endpoint", help="Public endpoint for clients")
+    p_addbulk.add_argument("--port", type=int, default=None)
 
     p_rem = sub.add_parser("remove-peer", help="Release a participant")
     p_rem.add_argument("username", nargs="?")
+
+    p_exp = sub.add_parser(
+        "export", help="Print or bundle generated client configs"
+    )
+    p_exp.add_argument("username", nargs="?")
+    p_exp.add_argument(
+        "--all", action="store_true", help="Bundle every config into a tarball"
+    )
+    p_exp.add_argument(
+        "--output", "-o", help="Write to this path instead of stdout"
+    )
 
     p_sum = sub.add_parser(
         "summon", help="Deploy a challenge from a directory"
@@ -1064,7 +1296,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     dispatch: Dict[str, MenuHandler] = {
         "init": cmd_init,
         "add-peer": cmd_add_peer,
+        "add-peers": cmd_add_peers,
         "remove-peer": cmd_remove_peer,
+        "export": cmd_export,
         "summon": cmd_summon,
         "release": cmd_release,
         "status": cmd_status,

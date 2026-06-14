@@ -22,6 +22,13 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_DB_PATH = Path("/var/lib/edo/edo.db")
 
+# Bump when the schema changes; add a matching branch in _migrate(). Tracked
+# via SQLite's built-in PRAGMA user_version so no extra bookkeeping table is
+# needed.
+#   v1: original peers/containers schema (private_key NOT NULL)
+#   v2: peers.private_key nullable (client-side key support, S1)
+SCHEMA_VERSION = 2
+
 
 @dataclass
 class Peer:
@@ -29,7 +36,9 @@ class Peer:
     username: str
     ip_address: str
     public_key: str
-    private_key: str
+    # None when the participant generated their own keypair and only gave us
+    # the public key — the server never holds their private key in that mode.
+    private_key: Optional[str]
 
 
 @dataclass
@@ -73,6 +82,9 @@ class DatabaseManager:
 
     def _init_schema(self) -> None:
         with self._conn() as c:
+            # Fresh installs get the latest schema directly (private_key
+            # nullable). Pre-existing installs created these tables with the
+            # old constraint; _migrate() upgrades them in place.
             c.execute(
                 """
                 CREATE TABLE IF NOT EXISTS peers (
@@ -80,7 +92,7 @@ class DatabaseManager:
                     username    TEXT UNIQUE NOT NULL,
                     ip_address  TEXT UNIQUE NOT NULL,
                     public_key  TEXT NOT NULL,
-                    private_key TEXT NOT NULL,
+                    private_key TEXT,
                     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
                 """
@@ -98,6 +110,51 @@ class DatabaseManager:
                 )
                 """
             )
+            self._migrate(c)
+            c.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+    def _migrate(self, c: sqlite3.Connection) -> None:
+        """Bring a pre-existing DB up to ``SCHEMA_VERSION``.
+
+        Runs inside the same transaction as ``_init_schema``. Each step is
+        written to be idempotent so it's safe even if user_version wasn't
+        stamped by an older edo (which never set it — those DBs report 0).
+        """
+        version = c.execute("PRAGMA user_version").fetchone()[0]
+        logger.debug("db schema at user_version=%d (target %d)", version, SCHEMA_VERSION)
+
+        # v1 -> v2: drop the NOT NULL on peers.private_key. SQLite can't
+        # ALTER a column constraint, so rebuild the table when (and only
+        # when) it still carries the old constraint.
+        if self._column_notnull(c, "peers", "private_key"):
+            logger.info("migrating peers table: private_key -> nullable")
+            c.execute(
+                """
+                CREATE TABLE peers_new (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username    TEXT UNIQUE NOT NULL,
+                    ip_address  TEXT UNIQUE NOT NULL,
+                    public_key  TEXT NOT NULL,
+                    private_key TEXT,
+                    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            c.execute(
+                "INSERT INTO peers_new "
+                "(id, username, ip_address, public_key, private_key, created_at) "
+                "SELECT id, username, ip_address, public_key, private_key, created_at "
+                "FROM peers"
+            )
+            c.execute("DROP TABLE peers")
+            c.execute("ALTER TABLE peers_new RENAME TO peers")
+
+    @staticmethod
+    def _column_notnull(c: sqlite3.Connection, table: str, column: str) -> bool:
+        for row in c.execute(f"PRAGMA table_info({table})"):
+            if row["name"] == column:
+                return bool(row["notnull"])
+        return False
 
     # ---- peers -----------------------------------------------------------
     def add_peer(
@@ -105,7 +162,7 @@ class DatabaseManager:
         username: str,
         ip_address: str,
         public_key: str,
-        private_key: str,
+        private_key: Optional[str] = None,
     ) -> Peer:
         try:
             with self._conn() as c:

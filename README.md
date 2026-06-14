@@ -126,7 +126,12 @@ Run `sudo edo` with no arguments for the menu:
 | --- | --- |
 | `edo init --endpoint HOST [--port N]` | Create the WireGuard server config, install iptables rules, create the Docker bridge, bring `wg0` up. Idempotent. |
 | `edo add-peer USERNAME --endpoint HOST` | Allocate the next free VPN IP, generate keys, append the peer to the server config, apply it live, and write a client `.conf`. |
+| `edo add-peer USERNAME --public-key KEY` | Client-side-key mode: the participant generates their own keypair and gives you only the public key. The server stores `private_key=NULL` and the rendered config carries a placeholder they fill in locally. The private key never touches the server. |
+| `edo add-peers --from teams.csv --endpoint HOST` | Bulk-import peers. CSV columns: `username` and optional `public_key` (header row optional). Username-only rows get server-generated keys; rows with a public key use client-side-key mode. One bad row never aborts the batch — a summary prints at the end. |
 | `edo remove-peer USERNAME` | Inverse of `add-peer`. |
+| `edo export USERNAME` | Print a peer's client config to stdout (pipe-friendly). |
+| `edo export USERNAME -o PATH` | Write a copy of the config to PATH. |
+| `edo export --all -o peers.tar.gz` | Bundle every peer's client config into a tarball. |
 | `edo summon PATH [--name NAME]` | Detect a `Dockerfile` or `docker-compose.yml` in `PATH`, build, run, attach to `edo_br0` with a static IP, log to DB. |
 | `edo release --container ID` | Stop + remove a single container. |
 | `edo release --all` | Stop + remove every container `edo` knows about. |
@@ -177,6 +182,51 @@ Docker's own `DOCKER` / `DOCKER-USER` chains are not modified. `edo teardown`
 unhooks and deletes only its own chain.
 
 ---
+
+## Key handling: server-side vs client-side
+
+By default (`edo add-peer alice`) edo generates the WireGuard keypair for
+you and writes a ready-to-import client config. Convenient, but the
+server then holds the participant's private key — in the SQLite DB and in
+the on-disk client config.
+
+For untrusted infra or a security-conscious CTF, prefer **client-side
+keys**: the participant generates their own keypair and gives you only
+the public half.
+
+Participant runs locally:
+
+```bash
+wg genkey | tee privatekey | wg pubkey > publickey
+cat publickey   # send this to the organizer
+```
+
+Organizer:
+
+```bash
+sudo python3 edo.py add-peer alice --public-key "$(cat publickey)"
+```
+
+The server stores `private_key=NULL`; the generated `alice.conf` has a
+`PrivateKey = <PASTE_YOUR_PRIVATE_KEY_HERE>` placeholder. The participant
+drops their private key into that one line and imports. The private key
+never exists on the server.
+
+Bulk version — a CSV with a `public_key` column uses client-side mode per
+row automatically:
+
+```csv
+username,public_key
+alice,bGmsK2...44chars...=
+bob,Qf9aBc...44chars...=
+```
+
+```bash
+sudo python3 edo.py add-peers --from teams.csv --endpoint vpn.example
+```
+
+The interactive `add-peer` flow also prompts for an optional public key,
+so menu users get the same choice.
 
 ## Container security model
 
