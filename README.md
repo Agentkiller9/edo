@@ -299,6 +299,7 @@ before touching anything.
 | `ModuleNotFoundError: docker` under sudo | `sudo` ignores the venv — run `sudo .venv/bin/python edo.py`. |
 | `apply_firewall` can't find the public interface | No default route — `ip -4 route show default` must return something. |
 | `wg-quick up wg0` says *already exists* | Harmless — edo treats it as a no-op. |
+| `summon` build fails | The full `docker build` log streams above the error — read it for the real cause (bad apt package name, missing `COPY` source, etc.). Reproduce standalone with `docker build -t test /path/to/challenge`. |
 | Container reaches the internet | `EDO_FORWARD` hook drifted below `DOCKER-FORWARD` — re-run `edo init`. |
 | Peer can't reach a container | Client `AllowedIPs` must include `10.9.0.0/24` (the generated config does). |
 | No handshake at all | Open `udp/51820` (provider firewall too), confirm `wg0` is up. |

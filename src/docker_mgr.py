@@ -14,12 +14,13 @@ images/containers/DB rows are torn down so the host is left as it was.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 # Deferred import: the docker SDK isn't required to *load* this module —
 # only to *use* it. That lets `edo doctor` run and tell the user the SDK is
@@ -378,6 +379,58 @@ def _is_address_in_use(err: "APIError") -> bool:
     )
 
 
+# ---- image build --------------------------------------------------------
+def build_image(image_tag: str, path: Path) -> Tuple[bool, str]:
+    """Build an image, preferring the ``docker build`` CLI (BuildKit).
+
+    The Docker Python SDK only drives the *legacy* builder, which buffers
+    build output and surfaces a generic "non-zero code" on failure — the
+    real cause (e.g. ``E: Package 'awk' has no installation candidate``)
+    gets swallowed. Shelling out to ``docker build`` streams the full
+    BuildKit log straight to the operator's terminal, so a failing RUN
+    shows its actual error inline.
+
+    Falls back to the SDK builder when the ``docker`` CLI isn't on PATH.
+    Returns ``(success, error_message)``.
+    """
+    if shutil.which("docker") is None:
+        return _build_image_sdk(image_tag, path)
+
+    logger.info("building image %s from %s (docker build / BuildKit)", image_tag, path)
+    env = {**os.environ, "DOCKER_BUILDKIT": "1"}
+    try:
+        # Intentionally NOT capturing output — we want the build log to
+        # stream live so errors are visible as they happen.
+        proc = subprocess.run(
+            ["docker", "build", "-t", image_tag, str(path)],
+            cwd=str(path),
+            env=env,
+            check=False,
+        )
+    except FileNotFoundError:
+        # docker vanished between the which() check and now — fall back.
+        return _build_image_sdk(image_tag, path)
+    if proc.returncode != 0:
+        return (
+            False,
+            f"docker build failed (exit {proc.returncode}). See the build "
+            "output above for the failing step — common causes: an invalid "
+            "apt package name, a missing COPY source, or a network error.",
+        )
+    return True, ""
+
+
+def _build_image_sdk(image_tag: str, path: Path) -> Tuple[bool, str]:
+    """Legacy fallback: build via the Docker SDK when the CLI is absent."""
+    client = _client()
+    logger.info("building image %s from %s (SDK legacy builder)", image_tag, path)
+    try:
+        client.images.build(path=str(path), tag=image_tag, rm=True)
+        return True, ""
+    except (BuildError, APIError) as e:
+        return False, f"build failed: {e}"
+
+
 # ---- Dockerfile deployment ---------------------------------------------
 def deploy_dockerfile(
     db: DatabaseManager,
@@ -393,14 +446,10 @@ def deploy_dockerfile(
     client = _client()
     image_tag = f"edo/{_normalize_project_name(challenge_name).removeprefix('edo_')}:latest"
 
-    # ---- build ----
-    try:
-        logger.info("building image %s from %s", image_tag, path)
-        image, _logs = client.images.build(path=str(path), tag=image_tag, rm=True)
-    except (BuildError, APIError) as e:
-        msg = str(e)
-        logger.error("image build failed: %s", msg)
-        return DeployResult(success=False, error=f"build failed: {msg}")
+    # ---- build (streams full BuildKit output to the terminal) ----
+    ok, build_error = build_image(image_tag, path)
+    if not ok:
+        return DeployResult(success=False, error=build_error)
 
     # ---- create + start, retrying on IP races ----
     # Two summons running close together can pick the same free IP from the
