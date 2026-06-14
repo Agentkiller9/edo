@@ -85,13 +85,13 @@ Hand `alice.conf` to the participant → they import it into the WireGuard app �
 | --- | --- |
 | `edo summon PATH [--name N]` | Build + run a `Dockerfile`/`compose` challenge on the bridge. If the name is already deployed, edo offers to replace it (interactive) or needs `--replace` (scripted). |
 | `edo summon PATH --replace` | Remove the existing container + image for this name, then redeploy clean. |
-| `edo release --container ID` | Release one container. |
+| `edo release --container REF` | Release one container. `REF` = the 12-char id from `status`, a full id, or a challenge name (ambiguous names are rejected with the candidates listed). |
 | `edo release --all` | Release every reanimated challenge. |
 
 #### 👁 Divination — read the battlefield
 | Command | Does |
 | --- | --- |
-| `edo status` | Live table: peers (online ✓/✗, last handshake, transfer) + containers. |
+| `edo status` | Live table: peers (online ✓/✗, last handshake, transfer) + containers. Reconciles against Docker first, auto-pruning records whose container no longer exists. |
 | `edo doctor [--no-runtime]` | Pre-flight every prerequisite; prints exact fix commands. Non-root. |
 
 #### ⛩ The Seal — lifecycle

@@ -797,22 +797,75 @@ def deploy_compose(
     return DeployResult(success=True, containers=records)
 
 
+class AmbiguousReference(Exception):
+    """Raised when a container reference matches more than one record."""
+
+    def __init__(self, ref: str, matches: List[Container]) -> None:
+        self.ref = ref
+        self.matches = matches
+        super().__init__(
+            f"'{ref}' matches {len(matches)} containers — be more specific"
+        )
+
+
 # ---- teardown ----------------------------------------------------------
-def teardown_container(db: DatabaseManager, container_id: str) -> bool:
+def teardown_container(db: DatabaseManager, ref: str) -> bool:
+    """Stop + remove a container and clear its DB row.
+
+    ``ref`` may be a full id, the 12-char id shown in ``status``, or a
+    challenge name. We resolve it against the DB so the **full** id is used
+    for both the docker removal and the DB delete — fixing the bug where a
+    short id silently failed to clear the record. Returns True if anything
+    was actually removed.
+    """
     client = _client()
+
+    # Resolve the reference to a tracked record so we delete the right row.
+    matches = db.find_containers(ref)
+    if len(matches) > 1:
+        raise AmbiguousReference(ref, matches)
+    target_id = matches[0].container_id if matches else ref
+
+    removed_docker = False
     try:
-        c = client.containers.get(container_id)
+        c = client.containers.get(target_id)
         c.stop(timeout=10)
         c.remove(force=True)
+        removed_docker = True
     except NotFound:
         logger.warning(
-            "container %s not found in docker; clearing DB record", container_id
+            "container %s not in docker; clearing stale DB record", target_id[:12]
         )
     except APIError as e:
-        logger.error("teardown failed for %s: %s", container_id, e)
+        logger.error("teardown failed for %s: %s", target_id[:12], e)
         return False
-    db.remove_container(container_id)
-    return True
+
+    removed_db = db.remove_container(target_id)
+    return removed_docker or removed_db
+
+
+def reconcile(db: DatabaseManager) -> int:
+    """Sync DB container records with reality. Returns rows pruned.
+
+    For every "running" record, check whether the container still exists in
+    docker. Gone → prune the row (this is what cleans up records left behind
+    by older releases that didn't match on the full id). Present but not
+    running → update the stored status. Best-effort; raises nothing the
+    caller can't ignore.
+    """
+    client = _client()
+    pruned = 0
+    for ct in db.get_active_containers():
+        try:
+            c = client.containers.get(ct.container_id)
+            if c.status != ct.status:
+                db.update_container_status(ct.container_id, c.status)
+        except NotFound:
+            db.remove_container(ct.container_id)
+            pruned += 1
+        except APIError as e:
+            logger.debug("reconcile skip %s: %s", ct.container_id[:12], e)
+    return pruned
 
 
 def teardown_compose(

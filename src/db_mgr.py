@@ -297,6 +297,26 @@ class DatabaseManager:
             )
             return cur.rowcount > 0
 
+    def find_containers(self, ref: str) -> List[Container]:
+        """Resolve a user-supplied reference to tracked container record(s).
+
+        Matches on full container id, **id prefix** (the 12-char id shown in
+        ``status``), or exact challenge name. Returns every match so the
+        caller can reject an ambiguous reference instead of acting on the
+        wrong container. ``ref`` is treated as a literal prefix — LIKE
+        wildcards in it are escaped.
+        """
+        ref = ref.strip()
+        escaped = ref.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM containers "
+                "WHERE container_id LIKE ? ESCAPE '\\' OR challenge_name = ? "
+                "ORDER BY id",
+                (escaped + "%", ref),
+            ).fetchall()
+        return [_row_to_container(r) for r in rows]
+
     def get_active_containers(self) -> List[Container]:
         with self._conn() as c:
             rows = c.execute(

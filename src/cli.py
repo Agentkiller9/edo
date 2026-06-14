@@ -733,9 +733,18 @@ def cmd_release(args: argparse.Namespace, db: DatabaseManager) -> int:
         _print("[!] container id required (or use --all)", style="bold red")
         return 2
 
-    ok = docker_mgr.teardown_container(db, cid)
+    try:
+        ok = docker_mgr.teardown_container(db, cid)
+    except docker_mgr.AmbiguousReference as e:
+        _print(
+            f"[!] '{e.ref}' matches {len(e.matches)} containers — pick one:",
+            style="bold red",
+        )
+        for m in e.matches:
+            _print(f"      {m.container_id[:12]}  {m.challenge_name}  @ {m.assigned_ip}")
+        return 2
     if ok:
-        _print(f"[+] Released {cid[:12]}.", style="green")
+        _print(f"[+] Released {cid}.", style="green")
         return 0
     _print(f"[!] Release failed for {cid}", style="bold red")
     return 1
@@ -743,6 +752,15 @@ def cmd_release(args: argparse.Namespace, db: DatabaseManager) -> int:
 
 def cmd_status(args: argparse.Namespace, db: DatabaseManager) -> int:
     peers = db.get_all_peers()
+    # Reconcile DB records against docker first so released/dead containers
+    # don't linger in the table. Best-effort — skip silently if docker is
+    # unreachable so `status` still works on a host without a live daemon.
+    try:
+        pruned = docker_mgr.reconcile(db)
+        if pruned:
+            _print(f"[*] pruned {pruned} stale container record(s).", style="dim")
+    except Exception as e:
+        logger.debug("reconcile skipped: %s", e)
     containers = db.get_active_containers()
     live = wireguard.get_live_peer_status()  # {} if wg0 is down
 
