@@ -346,6 +346,38 @@ def find_next_container_ip(db: DatabaseManager, also_used: List[str]) -> str:
     return iter_subnet_hosts(DOCKER_SUBNET, blocked)
 
 
+def _live_container_ip(
+    container: "docker.models.containers.Container",
+) -> Optional[str]:
+    """Read the container's actual IPv4 on ``edo_br0`` from Docker.
+
+    The address we *requested* and the address Docker *assigned* should
+    match, but recording the live value keeps the DB honest even if they
+    ever diverge (the source of the old compose recorded-vs-actual bug).
+    """
+    try:
+        container.reload()
+    except APIError:
+        return None
+    net = (
+        container.attrs.get("NetworkSettings", {})
+        .get("Networks", {})
+        .get(DOCKER_BRIDGE, {})
+    )
+    return net.get("IPAddress") or None
+
+
+def _is_address_in_use(err: "APIError") -> bool:
+    """Heuristic: did container create/start fail because the static IP was taken?"""
+    msg = str(err).lower()
+    return (
+        "address already in use" in msg
+        or "is already in use" in msg
+        or "no available" in msg
+        or "overlaps" in msg
+    )
+
+
 # ---- Dockerfile deployment ---------------------------------------------
 def deploy_dockerfile(
     db: DatabaseManager,
@@ -360,7 +392,6 @@ def deploy_dockerfile(
     ensure_network()
     client = _client()
     image_tag = f"edo/{_normalize_project_name(challenge_name).removeprefix('edo_')}:latest"
-    assigned_ip = find_next_container_ip(db, also_used=[])
 
     # ---- build ----
     try:
@@ -371,34 +402,71 @@ def deploy_dockerfile(
         logger.error("image build failed: %s", msg)
         return DeployResult(success=False, error=f"build failed: {msg}")
 
-    # ---- create + start ----
+    # ---- create + start, retrying on IP races ----
+    # Two summons running close together can pick the same free IP from the
+    # DB (read-then-write gap). Docker is the real authority on what's in use
+    # on the bridge, so on an address-in-use error we recompute the next free
+    # IP (excluding the one that just collided) and try again.
     container = None
-    try:
-        endpoint_cfg = client.api.create_endpoint_config(ipv4_address=assigned_ip)
-        networking_cfg = client.api.create_networking_config(
-            {DOCKER_BRIDGE: endpoint_cfg}
-        )
-        host_cfg = _build_secure_host_config(client, profile)
-        created = client.api.create_container(
-            image=image_tag,
-            name=_normalize_project_name(challenge_name),
-            networking_config=networking_cfg,
-            host_config=host_cfg,
-            labels={
-                "edo.challenge": challenge_name,
-                "edo.managed": "true",
-                "edo.security": profile.summary(),
-            },
-        )
-        client.api.start(created["Id"])
-        container = client.containers.get(created["Id"])
-    except APIError as e:
-        msg = str(e)
-        logger.error("container start failed: %s", msg)
-        _cleanup_partial(client, image_tag=image_tag, container=container)
+    assigned_ip: Optional[str] = None
+    tried: List[str] = []
+    last_error: str = ""
+    host_cfg = _build_secure_host_config(client, profile)
+    for _ in range(8):
+        assigned_ip = find_next_container_ip(db, also_used=tried)
+        try:
+            endpoint_cfg = client.api.create_endpoint_config(
+                ipv4_address=assigned_ip
+            )
+            networking_cfg = client.api.create_networking_config(
+                {DOCKER_BRIDGE: endpoint_cfg}
+            )
+            created = client.api.create_container(
+                image=image_tag,
+                name=_normalize_project_name(challenge_name),
+                networking_config=networking_cfg,
+                host_config=host_cfg,
+                labels={
+                    "edo.challenge": challenge_name,
+                    "edo.managed": "true",
+                    "edo.security": profile.summary(),
+                },
+            )
+            client.api.start(created["Id"])
+            container = client.containers.get(created["Id"])
+            break
+        except APIError as e:
+            last_error = str(e)
+            # Clean up a half-created container before retrying.
+            try:
+                client.containers.get(
+                    _normalize_project_name(challenge_name)
+                ).remove(force=True)
+            except (APIError, NotFound):
+                pass
+            if _is_address_in_use(e) and assigned_ip not in tried:
+                logger.warning(
+                    "ip %s already in use, retrying with next free address",
+                    assigned_ip,
+                )
+                tried.append(assigned_ip)
+                continue
+            logger.error("container start failed: %s", last_error)
+            _cleanup_partial(client, image_tag=image_tag)
+            return DeployResult(
+                success=False, error=f"run failed: {last_error}", image_tag=image_tag
+            )
+
+    if container is None:
+        _cleanup_partial(client, image_tag=image_tag)
         return DeployResult(
-            success=False, error=f"run failed: {msg}", image_tag=image_tag
+            success=False,
+            error=f"could not allocate a free container IP: {last_error}",
+            image_tag=image_tag,
         )
+
+    # Record the IP Docker actually assigned, not the one we requested.
+    assigned_ip = _live_container_ip(container) or assigned_ip
 
     # ---- DB record ----
     try:
@@ -517,28 +585,26 @@ def deploy_compose(
     for cid in container_ids:
         try:
             cont = client.containers.get(cid)
-            assigned_ip = find_next_container_ip(db, also_used=locally_used)
+            requested_ip = find_next_container_ip(db, also_used=locally_used)
             try:
                 client.api.connect_container_to_network(
-                    cid, DOCKER_BRIDGE, ipv4_address=assigned_ip
+                    cid, DOCKER_BRIDGE, ipv4_address=requested_ip
                 )
-                locally_used.append(assigned_ip)
             except APIError as e:
-                # Likely already attached; read the existing IP off the
-                # container and use that instead.
+                # Already attached (compose may have wired it up already) —
+                # not fatal; we'll read whatever IP it actually has below.
                 logger.debug(
-                    "attach to %s skipped for %s: %s",
-                    DOCKER_BRIDGE,
-                    cid,
-                    e,
+                    "attach to %s skipped for %s: %s", DOCKER_BRIDGE, cid, e
                 )
-                cont.reload()
-                networks = (
-                    cont.attrs.get("NetworkSettings", {})
-                    .get("Networks", {})
-                    .get(DOCKER_BRIDGE, {})
-                )
-                assigned_ip = networks.get("IPAddress") or assigned_ip
+
+            # Always record the IP the container *actually* holds on the
+            # bridge, never the one we requested. Previously the success
+            # branch trusted the requested IP while only the failure branch
+            # read the live value — so a successful-but-divergent attach left
+            # the DB (and `edo status`) showing the wrong address.
+            live_ip = _live_container_ip(cont)
+            assigned_ip = live_ip or requested_ip
+            locally_used.append(assigned_ip)
 
             record = db.add_container(
                 container_id=cid,

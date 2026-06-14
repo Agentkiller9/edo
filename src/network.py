@@ -525,3 +525,17 @@ def iter_subnet_hosts(network: ipaddress.IPv4Network, exclude: List[str]) -> str
         if candidate not in blocked:
             return candidate
     raise RuntimeError(f"subnet {network} is exhausted")
+
+
+def ordered_subnet_hosts(
+    network: ipaddress.IPv4Network, reserved: List[str]
+) -> List[str]:
+    """All assignable host IPs in ``network``, in order, minus ``reserved``.
+
+    ``reserved`` is for *static* reservations (server/gateway address) — not
+    for already-allocated peers, which the atomic allocator filters against
+    the live DB inside its transaction. Returning the full ordered list lets
+    the allocator pick the first one not currently in the table.
+    """
+    blocked = set(reserved)
+    return [str(h) for h in network.hosts() if str(h) not in blocked]

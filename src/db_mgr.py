@@ -182,6 +182,63 @@ class DatabaseManager:
             private_key=private_key,
         )
 
+    def allocate_peer(
+        self,
+        username: str,
+        public_key: str,
+        candidate_ips: List[str],
+        private_key: Optional[str] = None,
+    ) -> Peer:
+        """Pick the first free IP and insert the peer in one transaction.
+
+        ``candidate_ips`` is the full ordered list of assignable addresses
+        (see :func:`network.ordered_subnet_hosts`). We filter it against the
+        peers currently in the table *inside* the same transaction as the
+        INSERT, closing the read-then-write race that bit two concurrent
+        ``add-peer`` / ``add-peers`` invocations handing out the same IP.
+
+        If a competing process commits the same IP between our read and our
+        INSERT, SQLite raises a UNIQUE violation on ``ip_address``; we retry
+        with a fresh transaction (recomputing the free set). A username
+        collision raises ``ValueError`` immediately — that's not a race.
+        """
+        attempts = max(8, len(candidate_ips))
+        last_error: Optional[Exception] = None
+        for _ in range(attempts):
+            try:
+                with self._conn() as c:
+                    used = {
+                        r["ip_address"]
+                        for r in c.execute("SELECT ip_address FROM peers")
+                    }
+                    ip = next((x for x in candidate_ips if x not in used), None)
+                    if ip is None:
+                        raise RuntimeError("WireGuard subnet is exhausted")
+                    cur = c.execute(
+                        "INSERT INTO peers (username, ip_address, public_key, private_key)"
+                        " VALUES (?, ?, ?, ?)",
+                        (username, ip, public_key, private_key),
+                    )
+                    return Peer(
+                        id=int(cur.lastrowid),
+                        username=username,
+                        ip_address=ip,
+                        public_key=public_key,
+                        private_key=private_key,
+                    )
+            except sqlite3.IntegrityError as e:
+                msg = str(e).lower()
+                if "username" in msg:
+                    raise ValueError(f"peer '{username}' already exists") from e
+                if "ip_address" in msg:
+                    last_error = e
+                    continue  # lost the IP race — recompute and retry
+                raise
+        raise RuntimeError(
+            f"could not allocate an IP for '{username}' after {attempts} attempts"
+            f" (last error: {last_error})"
+        )
+
     def remove_peer(self, username: str) -> bool:
         with self._conn() as c:
             cur = c.execute("DELETE FROM peers WHERE username = ?", (username,))

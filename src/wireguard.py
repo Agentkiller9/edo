@@ -21,6 +21,7 @@ from src.network import (
     WG_SERVER_IP,
     WG_SUBNET,
     iter_subnet_hosts,
+    ordered_subnet_hosts,
 )
 
 logger = logging.getLogger(__name__)
@@ -151,10 +152,18 @@ def is_valid_wg_key(key: str) -> bool:
 def find_next_available_ip(db: DatabaseManager) -> str:
     """Return the next free address in the WireGuard subnet.
 
-    Excludes the server's own address and anything currently held in DB.
+    Non-atomic point-in-time read — fine for previewing the next IP, but
+    peer creation goes through :meth:`DatabaseManager.allocate_peer` which
+    allocates and inserts in one transaction. Excludes the server address
+    and anything currently in the DB.
     """
     blocked = list(db.get_used_peer_ips()) + [WG_SERVER_IP]
     return iter_subnet_hosts(WG_SUBNET, blocked)
+
+
+def _peer_candidate_ips() -> List[str]:
+    """Ordered list of assignable WG addresses (server IP reserved)."""
+    return ordered_subnet_hosts(WG_SUBNET, reserved=[WG_SERVER_IP])
 
 
 # ---- server lifecycle ---------------------------------------------------
@@ -332,9 +341,6 @@ def add_peer(
 
     Rolls back the DB record if any config/live-apply step raises.
     """
-    if db.get_peer(username):
-        raise ValueError(f"peer '{username}' already exists")
-
     if public_key is not None:
         public_key = public_key.strip()
         if not is_valid_wg_key(public_key):
@@ -347,12 +353,14 @@ def add_peer(
         kp = generate_keypair()
         stored_public, stored_private = kp.public_key, kp.private_key
 
-    ip = find_next_available_ip(db)
-    peer = db.add_peer(
+    # Atomic allocate-and-insert: picks the first free IP and writes the row
+    # in one transaction, retrying on the ip_address race. Raises ValueError
+    # if the username already exists.
+    peer = db.allocate_peer(
         username=username,
-        ip_address=ip,
         public_key=stored_public,
         private_key=stored_private,
+        candidate_ips=_peer_candidate_ips(),
     )
 
     out_dir = Path(clients_dir) if clients_dir is not None else WG_CLIENTS_DIR
