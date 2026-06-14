@@ -521,6 +521,7 @@ def cmd_release(args: argparse.Namespace, db: DatabaseManager) -> int:
 def cmd_status(args: argparse.Namespace, db: DatabaseManager) -> int:
     peers = db.get_all_peers()
     containers = db.get_active_containers()
+    live = wireguard.get_live_peer_status()  # {} if wg0 is down
 
     if _console:
         ptab = Table(
@@ -528,15 +529,28 @@ def cmd_status(args: argparse.Namespace, db: DatabaseManager) -> int:
             show_lines=False,
             header_style="bold magenta",
         )
-        for col in ("ID", "Username", "IP", "Public Key"):
+        for col in ("ID", "Username", "IP", "Online", "Last HS", "Transfer"):
             ptab.add_column(col)
         for p in peers:
-            pk = p.public_key
+            ls = live.get(p.public_key)
+            if ls is None:
+                online, hs, transfer = "—", "—", "—"
+                style = "dim"
+            else:
+                online = "[green]✓[/]" if ls.online else "[red]✗[/]"
+                hs = _format_handshake(ls.latest_handshake)
+                transfer = (
+                    f"{_format_bytes(ls.rx_bytes)}↓ {_format_bytes(ls.tx_bytes)}↑"
+                )
+                style = "" if ls.online else "dim"
             ptab.add_row(
                 str(p.id),
                 p.username,
                 p.ip_address,
-                (pk[:24] + "…") if len(pk) > 24 else pk,
+                online,
+                hs,
+                transfer,
+                style=style or None,
             )
         _console.print(ptab)
 
@@ -559,7 +573,17 @@ def cmd_status(args: argparse.Namespace, db: DatabaseManager) -> int:
     else:
         print("Peers:")
         for p in peers:
-            print(f"  {p.id}\t{p.username}\t{p.ip_address}")
+            ls = live.get(p.public_key)
+            state = (
+                f"online (HS {_format_handshake(ls.latest_handshake)})"
+                if ls and ls.online
+                else (
+                    f"offline (HS {_format_handshake(ls.latest_handshake)})"
+                    if ls
+                    else "offline (no record)"
+                )
+            )
+            print(f"  {p.id}\t{p.username}\t{p.ip_address}\t{state}")
         print("Containers:")
         for ct in containers:
             print(
@@ -567,6 +591,34 @@ def cmd_status(args: argparse.Namespace, db: DatabaseManager) -> int:
                 f"{ct.assigned_ip}\t{ct.status}"
             )
     return 0
+
+
+def _format_handshake(ts: int) -> str:
+    """Relative human-readable handshake age. ``0`` means never."""
+    if ts == 0:
+        return "never"
+    import time as _t
+
+    delta = int(_t.time()) - ts
+    if delta < 0:
+        return "now"
+    if delta < 60:
+        return f"{delta}s ago"
+    if delta < 3600:
+        return f"{delta // 60}m ago"
+    if delta < 86400:
+        return f"{delta // 3600}h ago"
+    return f"{delta // 86400}d ago"
+
+
+def _format_bytes(n: int) -> str:
+    if n < 1024:
+        return f"{n}B"
+    if n < 1024 ** 2:
+        return f"{n / 1024:.1f}K"
+    if n < 1024 ** 3:
+        return f"{n / 1024 ** 2:.1f}M"
+    return f"{n / 1024 ** 3:.1f}G"
 
 
 def cmd_purge(args: argparse.Namespace, db: Optional[DatabaseManager]) -> int:
@@ -657,11 +709,13 @@ def cmd_purge(args: argparse.Namespace, db: Optional[DatabaseManager]) -> int:
         lambda: "removed" if docker_mgr.remove_network() else "not present",
     )
 
-    # 3. Firewall: iptables chains + firewalld port.
+    # 3. Firewall: iptables chains + firewalld port. Read the port out
+    # of wg0.conf so we don't leak a custom --port across purge.
     def _wipe_firewall() -> str:
-        results = network.remove_firewall(wg_port=wireguard.WG_LISTEN_PORT)
+        port = wireguard.get_listen_port()
+        results = network.remove_firewall(wg_port=port)
         ok = sum(1 for r in results if r.success)
-        return f"{ok}/{len(results)} rule ops succeeded"
+        return f"{ok}/{len(results)} rule ops succeeded ({port}/udp)"
 
     _step("firewall rules", _wipe_firewall)
 
@@ -749,12 +803,15 @@ def cmd_teardown(args: argparse.Namespace, db: DatabaseManager) -> int:
             _print("[*] Aborted.", style="yellow")
             return 1
 
+    # Read the port actually in use from wg0.conf — don't close 51820 if
+    # the operator originally ran `init --port 31337`.
+    teardown_port = wireguard.get_listen_port()
     _print("[*] Releasing all reanimated vessels...")
     docker_mgr.teardown_all(db)
     _print("[*] Removing docker bridge...")
     docker_mgr.remove_network()
-    _print("[*] Lifting firewall rules...")
-    network.remove_firewall(wg_port=wireguard.WG_LISTEN_PORT)
+    _print(f"[*] Lifting firewall rules (closing {teardown_port}/udp)...")
+    network.remove_firewall(wg_port=teardown_port)
     _print(f"[*] Bringing {network.WG_INTERFACE} down...")
     wireguard.bring_down()
     _print("[+] Sealing tag lifted. Reanimation released.", style="green")

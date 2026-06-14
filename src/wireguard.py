@@ -6,11 +6,13 @@ without requiring a full ``wg-quick`` cycle.
 """
 from __future__ import annotations
 
+import configparser
 import logging
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from src.db_mgr import DatabaseManager, Peer
 from src.network import (
@@ -52,6 +54,33 @@ class ClientConfig:
     peer: Peer
     config_text: str
     config_path: Path
+
+
+@dataclass
+class LivePeerStatus:
+    """Snapshot of a peer's runtime state from ``wg show wg0 dump``.
+
+    Used by ``edo status`` to surface whether each bound vessel is
+    actually connected right now — the most common question an operator
+    has during a live CTF.
+    """
+
+    public_key: str
+    endpoint: Optional[str]
+    latest_handshake: int  # unix timestamp; 0 means never
+    rx_bytes: int
+    tx_bytes: int
+
+    @property
+    def online(self) -> bool:
+        """True if last handshake was within the WG keepalive window.
+
+        WG re-handshakes every ~120 seconds by default. 180s gives a one-
+        handshake grace period before we mark a peer offline.
+        """
+        if self.latest_handshake == 0:
+            return False
+        return (time.time() - self.latest_handshake) < 180
 
 
 # ---- subprocess helper --------------------------------------------------
@@ -132,17 +161,48 @@ def init_server(endpoint: str, port: int = WG_LISTEN_PORT) -> ServerConfig:
     )
 
 
+def _parse_interface_section() -> Dict[str, str]:
+    """Read ``wg0.conf``'s ``[Interface]`` block into a dict.
+
+    Uses :mod:`configparser` rather than line-by-line matching: handles
+    comments (``#`` / ``;``), arbitrary whitespace around ``=``, and
+    section detection, so a comment containing the word "PrivateKey"
+    can't be mistaken for the actual key. WG keys are case-sensitive so
+    we disable the default option-lowercasing behaviour.
+
+    Raises ``RuntimeError`` if the config is missing or has no
+    ``[Interface]`` section.
+    """
+    if not WG_SERVER_CONFIG.exists():
+        raise RuntimeError(f"{WG_SERVER_CONFIG} does not exist")
+    parser = configparser.ConfigParser(
+        strict=False,                    # duplicate [Peer] sections are legal in WG
+        allow_no_value=True,
+        comment_prefixes=("#", ";"),
+        inline_comment_prefixes=("#",),
+        interpolation=None,
+    )
+    # Preserve case — wg's keys are PascalCase.
+    parser.optionxform = str  # type: ignore[assignment]
+    try:
+        parser.read(WG_SERVER_CONFIG)
+    except configparser.Error as e:
+        raise RuntimeError(
+            f"failed to parse {WG_SERVER_CONFIG}: {e}"
+        ) from e
+    if "Interface" not in parser:
+        raise RuntimeError(
+            f"no [Interface] section in {WG_SERVER_CONFIG}"
+        )
+    return {k: (v or "").strip() for k, v in parser["Interface"].items()}
+
+
 def _load_server_config(endpoint: str, port: int) -> ServerConfig:
-    text = WG_SERVER_CONFIG.read_text()
-    priv = ""
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("PrivateKey"):
-            priv = stripped.split("=", 1)[1].strip()
-            break
+    iface = _parse_interface_section()
+    priv = iface.get("PrivateKey", "")
     if not priv:
         raise RuntimeError(
-            f"could not parse PrivateKey from {WG_SERVER_CONFIG}"
+            f"no PrivateKey in [Interface] of {WG_SERVER_CONFIG}"
         )
     return ServerConfig(
         private_key=priv,
@@ -150,6 +210,73 @@ def _load_server_config(endpoint: str, port: int) -> ServerConfig:
         endpoint=endpoint,
         listen_port=port,
     )
+
+
+def get_listen_port() -> int:
+    """Return the port the server is *actually* configured on.
+
+    Reads ``ListenPort`` out of ``wg0.conf``. Falls back to the default
+    if the file is missing or malformed — used by teardown to close the
+    right port even when ``--port`` was passed to a prior ``init``.
+    """
+    try:
+        iface = _parse_interface_section()
+    except RuntimeError:
+        return WG_LISTEN_PORT
+    raw = iface.get("ListenPort", "")
+    try:
+        return int(raw) if raw else WG_LISTEN_PORT
+    except ValueError:
+        logger.warning(
+            "ListenPort=%r in %s is not an integer; using default %d",
+            raw,
+            WG_SERVER_CONFIG,
+            WG_LISTEN_PORT,
+        )
+        return WG_LISTEN_PORT
+
+
+def get_live_peer_status() -> Dict[str, LivePeerStatus]:
+    """Snapshot of every peer attached to ``wg0`` right now.
+
+    Returns a dict keyed by public key. Empty dict if ``wg0`` is down or
+    the command fails — callers should treat absence as "offline" rather
+    than failing.
+
+    ``wg show wg0 dump`` format (tab-separated):
+        line 0: <priv> <pub> <listen-port> <fwmark>          (interface)
+        line 1+: <pub> <psk> <endpoint> <allowed-ips> <handshake> <rx> <tx> <keepalive>
+    """
+    try:
+        proc = _run(["wg", "show", WG_INTERFACE, "dump"], check=False)
+    except RuntimeError:
+        return {}
+    if proc.returncode != 0:
+        return {}
+
+    out: Dict[str, LivePeerStatus] = {}
+    lines = proc.stdout.splitlines()
+    # First line is the interface itself; skip.
+    for line in lines[1:]:
+        parts = line.split("\t")
+        if len(parts) < 7:
+            continue
+        public_key = parts[0]
+        endpoint = parts[2] if parts[2] != "(none)" else None
+        try:
+            handshake = int(parts[4])
+            rx = int(parts[5])
+            tx = int(parts[6])
+        except ValueError:
+            continue
+        out[public_key] = LivePeerStatus(
+            public_key=public_key,
+            endpoint=endpoint,
+            latest_handshake=handshake,
+            rx_bytes=rx,
+            tx_bytes=tx,
+        )
+    return out
 
 
 # ---- peer lifecycle -----------------------------------------------------

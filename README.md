@@ -130,7 +130,7 @@ Run `sudo edo` with no arguments for the menu:
 | `edo summon PATH [--name NAME]` | Detect a `Dockerfile` or `docker-compose.yml` in `PATH`, build, run, attach to `edo_br0` with a static IP, log to DB. |
 | `edo release --container ID` | Stop + remove a single container. |
 | `edo release --all` | Stop + remove every container `edo` knows about. |
-| `edo status` | Print the bound peers and running containers as tables. |
+| `edo status` | Print the bound peers and running containers as tables. The peer table shows live tunnel state pulled from `wg show wg0 dump` — an **Online** column (✓/✗), **Last HS** (handshake age), and **Transfer** (rx↓/tx↑) — so you can see at a glance who's actually connected during a CTF. Peers with no live record (wg0 down, or never connected) show `—`. |
 | `edo teardown [--yes]` | Release every container, remove the bridge, lift the firewall, bring `wg0` down. State (server config, client configs, DB) is preserved so the next `init` restores everything. |
 | `edo purge [--yes] [--wipe-state]` | Deep cleanup. Like `teardown`, but also: removes every container labelled `edo.managed=true`, disables `wg-quick@wg0.service`, strips any leftover `EDO_FORWARD`/`EDO_INPUT` chains. Add `--wipe-state` to also delete `/etc/wireguard/wg0.conf`, the client configs, and the SQLite DB. Use when the host is in an unknown state or you're migrating bridge modes. |
 | `edo menu` | Open the interactive menu (this is also the default with no command). |
