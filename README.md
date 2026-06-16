@@ -11,6 +11,8 @@
   ██████████ ████████▀   ▀██████▀
 </pre>
 
+### 𝐄𝐝𝐨 𝐓𝐞𝐧𝐬𝐞𝐢 · 反 ❲ reanimation protocol ❳ 魂
+
 **edo** — CTF infrastructure orchestrator
 
 A single-operator CLI that ties WireGuard and Docker together so you can stand up
@@ -396,6 +398,12 @@ through `subprocess.run(..., capture_output=True, check=True)` with explicit
 
 ---
 
+## License
+
+Released under the [MIT License](LICENSE).
+
+---
+
 <div align="center">
-<sub>edo · CTF infrastructure orchestrator</sub>
+<sub>𝐞𝐝𝐨 · 反 the dead fight on 魂 · CTF infrastructure orchestrator</sub>
 </div>
