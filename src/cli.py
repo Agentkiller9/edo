@@ -72,10 +72,17 @@ def _confirm(prompt: str, default: bool = False) -> bool:
 def require_root() -> None:
     geteuid = getattr(os, "geteuid", None)
     if geteuid is None or geteuid() != 0:
+        # Point the tip at the venv the user actually has, if we can find it.
+        venv = preflight._detect_active_venv()
+        if venv is not None:
+            example = f"sudo {venv}/bin/python {Path(sys.argv[0]).name}"
+        else:
+            example = "sudo ./venv/bin/python edo.py"
         _print(
             "[!] edo requires root (sudo). iptables and WireGuard need it.\n"
-            "    Tip: if you installed in a venv, sudo your venv's interpreter:\n"
-            "         sudo ./myvenv/bin/python edo.py",
+            "    Note: `sudo python3` ignores an activated venv (it resets PATH),\n"
+            "    so sudo your venv's interpreter directly:\n"
+            f"         {example}",
             style="bold red",
         )
         sys.exit(1)

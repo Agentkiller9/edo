@@ -187,13 +187,40 @@ def check_python_pkg(name: str, severity: Severity = Severity.CRITICAL) -> Check
         )
 
 
+def _is_venv_dir(p: Path) -> bool:
+    """A directory is a venv if it carries pyvenv.cfg and a python binary."""
+    if not (p / "pyvenv.cfg").is_file():
+        return False
+    return (p / "bin" / "python").exists() or (p / "Scripts" / "python.exe").exists()
+
+
 def _detect_active_venv() -> Optional[Path]:
-    """Look for an obvious venv adjacent to the project — heuristic only."""
-    cwd = Path.cwd()
-    for candidate in (".venv", "venv", "myvenv", "env"):
-        p = cwd / candidate
-        if (p / "bin" / "python").exists() or (p / "Scripts" / "python.exe").exists():
+    """Find a virtualenv associated with this project, whatever it's named.
+
+    Order of preference:
+      1. ``$VIRTUAL_ENV`` — set when a venv is activated; survives ``sudo -E``.
+      2. Any immediate subdirectory of the CWD that looks like a venv
+         (has ``pyvenv.cfg``). Catches arbitrary names like ``edovenv`` that
+         a hardcoded list would miss.
+    """
+    env = os.environ.get("VIRTUAL_ENV")
+    if env:
+        p = Path(env)
+        if _is_venv_dir(p):
             return p
+
+    cwd = Path.cwd()
+    # Common names first (cheap, deterministic ordering), then scan.
+    for candidate in (".venv", "venv", "myvenv", "edovenv", "env"):
+        p = cwd / candidate
+        if _is_venv_dir(p):
+            return p
+    try:
+        for child in sorted(cwd.iterdir()):
+            if child.is_dir() and _is_venv_dir(child):
+                return child
+    except OSError:
+        pass
     return None
 
 
