@@ -486,16 +486,46 @@ def _is_address_in_use(err: "APIError") -> bool:
     )
 
 
+_buildkit_ok: Optional[bool] = None
+
+
+def _buildkit_available() -> bool:
+    """True if the buildx plugin is installed (BuildKit needs it).
+
+    ``docker.io`` from a distro repo often ships without buildx, in which
+    case forcing ``DOCKER_BUILDKIT=1`` fails with "buildx component is
+    missing or broken". Cached after the first probe.
+    """
+    global _buildkit_ok
+    if _buildkit_ok is not None:
+        return _buildkit_ok
+    try:
+        proc = subprocess.run(
+            ["docker", "buildx", "version"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        _buildkit_ok = proc.returncode == 0
+    except OSError:
+        _buildkit_ok = False
+    return _buildkit_ok
+
+
 # ---- image build --------------------------------------------------------
 def build_image(image_tag: str, path: Path) -> Tuple[bool, str]:
-    """Build an image, preferring the ``docker build`` CLI (BuildKit).
+    """Build an image by shelling out to the ``docker build`` CLI.
 
     The Docker Python SDK only drives the *legacy* builder, which buffers
     build output and surfaces a generic "non-zero code" on failure — the
     real cause (e.g. ``E: Package 'awk' has no installation candidate``)
-    gets swallowed. Shelling out to ``docker build`` streams the full
-    BuildKit log straight to the operator's terminal, so a failing RUN
-    shows its actual error inline.
+    gets swallowed. Shelling out to the CLI streams the full build log
+    straight to the operator's terminal, so a failing RUN shows its actual
+    error inline. This works with either builder.
+
+    We only enable BuildKit when the buildx plugin is present; otherwise we
+    force the legacy builder (``DOCKER_BUILDKIT=0``) so a host whose Docker
+    ships without buildx doesn't fail with "buildx component is missing".
 
     Falls back to the SDK builder when the ``docker`` CLI isn't on PATH.
     Returns ``(success, error_message)``.
@@ -503,8 +533,10 @@ def build_image(image_tag: str, path: Path) -> Tuple[bool, str]:
     if shutil.which("docker") is None:
         return _build_image_sdk(image_tag, path)
 
-    logger.info("building image %s from %s (docker build / BuildKit)", image_tag, path)
-    env = {**os.environ, "DOCKER_BUILDKIT": "1"}
+    use_buildkit = _buildkit_available()
+    builder = "BuildKit" if use_buildkit else "legacy builder"
+    logger.info("building image %s from %s (docker build / %s)", image_tag, path, builder)
+    env = {**os.environ, "DOCKER_BUILDKIT": "1" if use_buildkit else "0"}
     try:
         # Intentionally NOT capturing output — we want the build log to
         # stream live so errors are visible as they happen.
